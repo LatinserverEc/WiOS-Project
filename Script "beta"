@@ -1,0 +1,2105 @@
+El siguiente Script es para optimizar y hacer debloat a Windows 11, NO ES FUNCIONAL AÚN, puesto que estaba en desarrollo, pero ya me harté porque agrego algo, deja de funcionar, quito algo, deja de funcionar, dejo como originalmente estaba (nivel muy básico) y si, funciona, vuelvo a empezar y agrego cosa por cosa, y vuelve a fallar, y aclaro que no soy experto en el tema de la programación o desarrollo de software, pero algo - algo comprendo, solo que ya se me sale del presupuesto mental jajajajajaja, les dejo el script hasta donde avancé por si alguien se interesa y quiere continuarlo, corregirlo y finalizarlo. La idea es que mientras menos toque en el sistema, mucho mejor para la estabilidad e integridad del mismo.
+
+Script WiOS Project:
+
+<#
+.SYNOPSIS
+    Script simplificado para personalizar Windows 11 - Versión DISM mejorada y optimizada
+.DESCRIPTION
+    Usa DISM nativo (más estable) para procesar imágenes
+    Flujo optimizado: montar, modificar y exportar en un solo paso
+    Usa oscdimg para crear ISO booteable
+    Mejorado con monitoreo de progreso y feedback visual
+    Todo automático con limpieza al finalizar
+#>
+
+#---------[ AUTO-ELEVACIÓN AUTOMÁTICA ]---------
+# Verificar si se ejecuta como administrador y auto-elevar
+if (-NOT ([Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
+    
+    # Configurar ejecución de scripts
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+    
+    # Crear argumentos para nueva ventana elevada
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    
+    Write-Host "Reiniciando como Administrador..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
+    
+    # Ejecutar como administrador
+    Start-Process PowerShell -Verb RunAs -ArgumentList $arguments
+    exit
+}
+
+#---------[ CONFIGURACIÓN FIJA ]---------
+$WorkingPath = "C:\ISO_File"
+$WindowsDir = "$WorkingPath\Windows"
+$SourcesDir = "$WindowsDir\sources"
+$MountDir = "$WorkingPath\MOUNT"
+$TempDir = "$WorkingPath\TEMP"
+$ToolsDir = "$WorkingPath\TOOLS"
+$LogsDir = "$WorkingPath\LOGS"
+
+# Herramientas portables (solo oscdimg es necesario)
+$OscdimgExe = "$ToolsDir\oscdimg.exe"
+
+# Log (inicialmente en WorkingPath, luego se mueve a LOGS)
+$LogFile = "$WorkingPath\WindowsCustomizer_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$StartTime = Get-Date
+
+# Variable global para control de ISO
+$global:CanCreateISO = $false
+
+#---------[ FUNCIONES BÁSICAS ]---------
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    Write-Host $logMessage
+    $logMessage | Out-File -FilePath $LogFile -Append
+}
+
+function Show-Header {
+    Clear-Host
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "         PERSONALIZADOR DE WINDOWS 11" -ForegroundColor Cyan
+    Write-Host "       (Versión DISM Optimizada - WiOS Project)" -ForegroundColor Cyan
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Show-Spinner {
+    param(
+        [string]$Message,
+        [int]$DurationSeconds = 0
+    )
+    
+    $spinner = @('|', '/', '-', '\')
+    $startTime = Get-Date
+    $i = 0
+    
+    if ($DurationSeconds -gt 0) {
+        while (((Get-Date) - $startTime).TotalSeconds -lt $DurationSeconds) {
+            Write-Host "`r$Message $($spinner[$i % 4])" -NoNewline -ForegroundColor Cyan
+            Start-Sleep -Milliseconds 100
+            $i++
+        }
+    } else {
+        # Spinner infinito (se detiene con Ctrl+C)
+        try {
+            while ($true) {
+                Write-Host "`r$Message $($spinner[$i % 4])" -NoNewline -ForegroundColor Cyan
+                Start-Sleep -Milliseconds 100
+                $i++
+            }
+        } catch {
+            # Se interrumpió
+            Write-Host ""
+        }
+    }
+    
+    Write-Host ""
+}
+
+function Monitor-DismProcess {
+    param(
+        [int]$ProcessId,
+        [string]$TempFile,
+        [string]$ActivityName
+    )
+    
+    $startTime = Get-Date
+    $dots = 0
+    
+    while (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+        $elapsed = (Get-Date) - $startTime
+        $minutes = [math]::Floor($elapsed.TotalMinutes)
+        $seconds = [math]::Round($elapsed.TotalSeconds % 60)
+        
+        # Animación simple
+        $dots = ($dots + 1) % 4
+        $animation = "." * $dots + " " * (3 - $dots)
+        
+        # Mostrar información
+        Write-Host "`r[$($minutes.ToString('00')):$($seconds.ToString('00'))] $ActivityName$animation" -NoNewline -ForegroundColor Gray
+        
+        # Si existe el archivo temporal, mostrar su tamaño
+        if (Test-Path $TempFile) {
+            $sizeMB = [math]::Round((Get-Item $TempFile).Length / 1MB, 1)
+            Write-Host " [Archivo: $sizeMB MB]" -NoNewline -ForegroundColor Cyan
+        }
+        
+        Start-Sleep -Seconds 1
+    }
+    
+    Write-Host ""  # Nueva línea al final
+}
+
+function Pause-And-Exit {
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Gray
+    Write-Host "Presiona 0 o Q para salir, cualquier otra tecla para continuar..." -ForegroundColor Yellow
+    
+    do {
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $keyChar = [char]$key.VirtualKeyCode
+        
+        # Verificar si es 0, Q, q, o Escape
+        if ($key.VirtualKeyCode -eq 48 -or 
+            $key.VirtualKeyCode -eq 81 -or 
+            $key.VirtualKeyCode -eq 113 -or 
+            $key.VirtualKeyCode -eq 27) {
+            Write-Host "`nSaliendo..." -ForegroundColor Gray
+            
+            # Limpiar antes de salir
+            try {
+                Cleanup-AllTemporary
+                Move-LogToFolder
+            } catch {
+                # Ignorar errores de limpieza al salir
+            }
+            
+            exit
+        }
+        
+        # Si no es 0, Q o Escape, salir del bucle y continuar
+        break
+        
+    } while ($true)
+}
+
+function Get-UserInput {
+    param(
+        [string]$Prompt,
+        [string]$Default = "",
+        [switch]$AllowCancel = $true
+    )
+    
+    Write-Host $Prompt -NoNewline -ForegroundColor White
+    
+    if ($AllowCancel) {
+        Write-Host " (Presiona 0 o Q para cancelar)" -NoNewline -ForegroundColor Yellow
+    }
+    
+    Write-Host ": " -NoNewline
+    
+    $input = Read-Host
+    
+    # Verificar si el usuario quiere cancelar
+    if ($AllowCancel -and ($input -eq "0" -or $input -eq "q" -or $input -eq "Q")) {
+        Write-Host "`nOperación cancelada por el usuario." -ForegroundColor Yellow
+        Cleanup-AllTemporary
+        Move-LogToFolder
+        exit
+    }
+    
+    # Si no hay entrada y hay un valor por defecto, usarlo
+    if ([string]::IsNullOrWhiteSpace($input) -and -not [string]::IsNullOrWhiteSpace($Default)) {
+        return $Default
+    }
+    
+    return $input
+}
+
+function Cleanup-PreviousMounts {
+    Write-Log "=== LIMPIEZA DE MONTAJES PREVIOS ==="
+    
+    # Limpiar cualquier montaje residual en MOUNT
+    if (Test-Path "$MountDir\*") {
+        Write-Log "Limpiando directorio de montaje..."
+        try {
+            # Intentar desmontar con DISM
+            Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+        } catch {
+            # Ignorar errores de desmontaje
+        }
+        
+        # Forzar eliminación
+        Remove-Item "$MountDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    
+    # Verificar si hay procesos usando la carpeta
+    $processes = Get-Process | Where-Object { 
+        $_.Path -like "$MountDir*" -or 
+        $_.Modules.FileName -like "$MountDir*"
+    }
+    
+    if ($processes) {
+        Write-Log "Deteniendo procesos usando el directorio de montaje..."
+        $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    
+    # Asegurar que el directorio existe y está vacío
+    if (-not (Test-Path $MountDir)) {
+        New-Item -ItemType Directory -Path $MountDir -Force | Out-Null
+    } else {
+        # Vaciar completamente
+        Get-ChildItem -Path $MountDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    
+    Write-Log "✓ Limpieza de montajes completada"
+}
+
+function Cleanup-AllTemporary {
+    Write-Log "=== LIMPIANDO ARCHIVOS TEMPORALES ==="
+    
+    # Limpiar MOUNT
+    if (Test-Path "$MountDir\*") {
+        Write-Log "Limpiando directorio de montaje..."
+        try {
+            Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+        } catch {
+            # Ignorar errores
+        }
+        Remove-Item "$MountDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "  ✓ MOUNT limpiado"
+    }
+    
+    # Limpiar TEMP completamente
+    if (Test-Path $TempDir) {
+        Write-Log "Limpiando directorio temporal..."
+        Remove-Item "$TempDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "  ✓ TEMP limpiado"
+    }
+    
+    Write-Log "✓ Limpieza de temporales completada"
+}
+
+function Move-LogToFolder {
+    Write-Log "Organizando archivos de log..."
+    
+    try {
+        # Crear carpeta LOGS si no existe
+        if (-not (Test-Path $LogsDir)) {
+            New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+            Write-Log "Creada carpeta LOGS: $LogsDir"
+        }
+        
+        # Mover el log actual a carpeta LOGS
+        if (Test-Path $LogFile) {
+            $logFileName = Split-Path $LogFile -Leaf
+            $logDest = "$LogsDir\$logFileName"
+            
+            # Cerrar el archivo de log primero
+            Start-Sleep -Milliseconds 500
+            
+            Move-Item $LogFile $logDest -Force -ErrorAction SilentlyContinue
+            
+            # Actualizar variable global
+            $global:LogFile = $logDest
+            Write-Log "✓ Log movido a: $logDest"
+        }
+        
+        # Mover logs antiguos si existen en raíz
+        $oldLogs = Get-ChildItem -Path "$WorkingPath\*.log" -ErrorAction SilentlyContinue
+        if ($oldLogs) {
+            Write-Log "Moviendo logs antiguos a carpeta LOGS..."
+            foreach ($oldLog in $oldLogs) {
+                $dest = "$LogsDir\$($oldLog.Name)"
+                Move-Item $oldLog.FullName $dest -Force -ErrorAction SilentlyContinue
+            }
+            Write-Log "  ✓ $($oldLogs.Count) logs movidos"
+        }
+        
+    } catch {
+        Write-Log "ERROR moviendo logs: ${_}" -Level "ERROR"
+    }
+}
+
+function Test-Requirements {
+    Write-Log "=== VERIFICANDO REQUISITOS ==="
+    
+    # Verificar directorios base
+    if (-not (Test-Path $WorkingPath)) {
+        Write-Host "ERROR: No existe C:\ISO_File\" -ForegroundColor Red
+        Write-Host "Crea la carpeta C:\ISO_File\ con esta estructura:" -ForegroundColor Yellow
+        Write-Host "  C:\ISO_File\" -ForegroundColor Gray
+        Write-Host "  ├── TOOLS\     (con oscdimg.exe)" -ForegroundColor Gray
+        Write-Host "  ├── Windows\   (contenido de instalación)" -ForegroundColor Gray
+        Write-Host "  ├── LOGS\      (logs se guardan aquí)" -ForegroundColor Gray
+        Write-Host "  └── MOUNT\     (se crea automáticamente)" -ForegroundColor Gray
+        
+        Write-Host "`nPresiona cualquier tecla para salir..." -ForegroundColor Yellow
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit
+    }
+    
+    # Verificar oscdimg
+    if (-not (Test-Path $OscdimgExe)) {
+        Write-Host "ADVERTENCIA: oscdimg.exe no encontrado en $ToolsDir" -ForegroundColor Yellow
+        Write-Host "No se podrá crear ISO booteable" -ForegroundColor Gray
+        $global:CanCreateISO = $false
+    } else {
+        $global:CanCreateISO = $true
+        Write-Log "✓ oscdimg.exe encontrado"
+    }
+    
+    # Verificar DISM (siempre está en Windows)
+    Write-Log "✓ DISM disponible (nativo de Windows)"
+    
+    # Crear directorios necesarios
+    @($MountDir, $TempDir, $LogsDir) | ForEach-Object {
+        if (-not (Test-Path $_)) {
+            New-Item -ItemType Directory -Path $_ -Force | Out-Null
+            Write-Log "Creado directorio: $_"
+        }
+    }
+}
+
+function Create-Autounattend {
+    Write-Log "Creando archivo autounattend.xml..."
+    
+    $autounattendPath = "$WindowsDir\autounattend.xml"
+    
+    $autounattendContent = @'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+	<settings pass="offlineServicing"></settings>
+	<settings pass="windowsPE">
+		<component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+			<UserData>
+				<ProductKey>
+					<Key>00000-00000-00000-00000-00000</Key>
+					<WillShowUI>Always</WillShowUI>
+				</ProductKey>
+				<AcceptEula>true</AcceptEula>
+			</UserData>
+			<UseConfigurationSet>false</UseConfigurationSet>
+		</component>
+	</settings>
+	<settings pass="generalize"></settings>
+	<settings pass="specialize">
+		<component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+			<RunSynchronous>
+				<RunSynchronousCommand wcm:action="add">
+					<Order>1</Order>
+					<Path>powershell.exe -WindowStyle "Normal" -NoProfile -Command "$xml = [xml]::new(); $xml.Load('C:\Windows\Panther\unattend.xml'); $sb = [scriptblock]::Create( $xml.unattend.Extensions.ExtractScript ); Invoke-Command -ScriptBlock $sb -ArgumentList $xml;"</Path>
+				</RunSynchronousCommand>
+				<RunSynchronousCommand wcm:action="add">
+					<Order>2</Order>
+					<Path>powershell.exe -WindowStyle "Normal" -ExecutionPolicy "Unrestricted" -NoProfile -File "C:\Windows\Setup\Scripts\Specialize.ps1"</Path>
+				</RunSynchronousCommand>
+			</RunSynchronous>
+		</component>
+	</settings>
+	<settings pass="auditSystem"></settings>
+	<settings pass="auditUser"></settings>
+	<settings pass="oobeSystem">
+		<component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+			<OOBE>
+				<ProtectYourPC>3</ProtectYourPC>
+				<HideEULAPage>true</HideEULAPage>
+				<HideWirelessSetupInOOBE>false</HideWirelessSetupInOOBE>
+				<HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+			</OOBE>
+			<FirstLogonCommands>
+				<SynchronousCommand wcm:action="add">
+					<Order>1</Order>
+					<CommandLine>powershell.exe -WindowStyle "Normal" -ExecutionPolicy "Unrestricted" -NoProfile -File "C:\Windows\Setup\Scripts\FirstLogon.ps1"</CommandLine>
+				</SynchronousCommand>
+			</FirstLogonCommands>
+		</component>
+	</settings>
+	<Extensions xmlns="https://schneegans.de/windows/unattend-generator/">
+		<ExtractScript>
+param(
+    [xml] $Document
+);
+
+foreach( $file in $Document.unattend.Extensions.File ) {
+    $path = [System.Environment]::ExpandEnvironmentVariables( $file.GetAttribute( 'path' ) );
+    mkdir -Path( $path | Split-Path -Parent ) -ErrorAction 'SilentlyContinue';
+    $encoding = switch( [System.IO.Path]::GetExtension( $path ) ) {
+        { $_ -in '.ps1', '.xml' } { [System.Text.Encoding]::UTF8; }
+        { $_ -in '.reg', '.vbs', '.js' } { [System.Text.UnicodeEncoding]::new( $false, $true ); }
+        default { [System.Text.Encoding]::Default; }
+    };
+    $bytes = $encoding.GetPreamble() + $encoding.GetBytes( $file.InnerText.Trim() );
+    [System.IO.File]::WriteAllBytes( $path, $bytes );
+}
+		</ExtractScript>
+		<File path="C:\Windows\Setup\Scripts\Specialize.ps1">
+$scripts = @(
+	{
+		net.exe accounts /maxpwage:UNLIMITED;
+	};
+	{
+		reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+	};
+	{
+		reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v "PreventDeviceEncryption" /t REG_DWORD /d 1 /f;
+	};
+	{
+		reg.exe add "HKLM\Software\Policies\Microsoft\Edge" /v HideFirstRunExperience /t REG_DWORD /d 1 /f;
+	};
+);
+
+&amp; {
+  [float] $complete = 0;
+  [float] $increment = 100 / $scripts.Count;
+  foreach( $script in $scripts ) {
+    Write-Progress -Activity 'Running scripts to customize your Windows installation. Do not close this window.' -PercentComplete $complete;
+    '*** Will now execute command &#xAB;{0}&#xBB;.' -f $(
+      $str = $script.ToString().Trim() -replace '\s+', ' ';
+      $max = 100;
+      if( $str.Length -le $max ) {
+        $str;
+      } else {
+        $str.Substring( 0, $max - 1 ) + '&#x2026;';
+      }
+    );
+    $start = [datetime]::Now;
+    &amp; $script;
+    '*** Finished executing command after {0:0} ms.' -f [datetime]::Now.Subtract( $start ).TotalMilliseconds;
+    "`r`n" * 3;
+    $complete += $increment;
+  }
+} *&gt;&amp;1 | Out-String -Width 1KB -Stream &gt;&gt; "C:\Windows\Setup\Scripts\Specialize.log";
+		</File>
+		<File path="C:\Windows\Setup\Scripts\FirstLogon.ps1">
+$scripts = @(
+	{
+		Remove-Item -LiteralPath @(
+		  'C:\Windows\Panther\unattend.xml';
+		  'C:\Windows\Panther\unattend-original.xml';
+		  'C:\Windows\Setup\Scripts\Wifi.xml';
+		) -Force -ErrorAction 'SilentlyContinue' -Verbose;
+	};
+);
+
+&amp; {
+  [float] $complete = 0;
+  [float] $increment = 100 / $scripts.Count;
+  foreach( $script in $scripts ) {
+    Write-Progress -Activity 'Running scripts to finalize your Windows installation. Do not close this window.' -PercentComplete $complete;
+    '*** Will now execute command &#xAB;{0}&#xBB;.' -f $(
+      $str = $script.ToString().Trim() -replace '\s+', ' ';
+      $max = 100;
+      if( $str.Length -le $max ) {
+        $str;
+      } else {
+        $str.Substring( 0, $max - 1 ) + '&#x2026;';
+      }
+    );
+    $start = [datetime]::Now;
+    &amp; $script;
+    '*** Finished executing command after {0:0} ms.' -f [datetime]::Now.Subtract( $start ).TotalMilliseconds;
+    "`r`n" * 3;
+    $complete += $increment;
+  }
+} *&gt;&amp;1 | Out-String -Width 1KB -Stream &gt;&gt; "C:\Windows\Setup\Scripts\FirstLogon.log";
+		</File>
+	</Extensions>
+</unattend>
+'@
+    
+    try {
+        $autounattendContent | Out-File -FilePath $autounattendPath -Encoding UTF8
+        Write-Log "✓ autounattend.xml creado en: $autounattendPath"
+        return $true
+    } catch {
+        Write-Log "ERROR creando autounattend.xml: ${_}" -Level "ERROR"
+        return $false
+    }
+}
+
+function Find-InstallFile {
+    Write-Log "Buscando archivo de instalación..."
+    
+    # Buscar install.wim o install.esd
+    $installFiles = @()
+    
+    if (Test-Path "$SourcesDir\install.wim") {
+        $installFiles += @{Path="$SourcesDir\install.wim"; Type="WIM"}
+    }
+    
+    if (Test-Path "$SourcesDir\install.esd") {
+        $installFiles += @{Path="$SourcesDir\install.esd"; Type="ESD"}
+    }
+    
+    if ($installFiles.Count -eq 0) {
+        Write-Host "ERROR: No se encontró install.wim ni install.esd en:" -ForegroundColor Red
+        Write-Host "  $SourcesDir" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Asegúrate de que existe uno de estos archivos:" -ForegroundColor Gray
+        Write-Host "  • C:\ISO_File\Windows\sources\install.wim" -ForegroundColor Gray
+        Write-Host "  • C:\ISO_File\Windows\sources\install.esd" -ForegroundColor Gray
+        
+        Write-Host "`nPresiona cualquier tecla para salir..." -ForegroundColor Yellow
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit
+    }
+    
+    # Si hay ambos, preferir WIM
+    $installFile = $installFiles | Where-Object { $_.Type -eq "WIM" } | Select-Object -First 1
+    if (-not $installFile) {
+        $installFile = $installFiles[0]
+    }
+    
+    Write-Log "✓ Archivo encontrado: $($installFile.Path)"
+    return $installFile
+}
+
+function Get-ImageInfo {
+    param([string]$ImagePath)
+    
+    Write-Log "Leyendo información de la imagen..."
+    
+    try {
+        $images = Get-WindowsImage -ImagePath $ImagePath -ErrorAction Stop
+        Write-Log "✓ $($images.Count) ediciones encontradas"
+        return $images
+    } catch {
+        Write-Host "ERROR: No se pudo leer la imagen $ImagePath" -ForegroundColor Red
+        Write-Host "Detalles: ${_}" -ForegroundColor Yellow
+        Write-Log "ERROR leyendo imagen: ${_}" -Level "ERROR"
+        
+        Write-Host "`nPresiona cualquier tecla para salir..." -ForegroundColor Yellow
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit
+    }
+}
+
+function Select-Edition {
+    param([array]$Images)
+    
+    Show-Header
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "          EDICIONES DISPONIBLES" -ForegroundColor Cyan
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Mostrar lista numerada
+    for ($i = 0; $i -lt $Images.Count; $i++) {
+        $sizeGB = [math]::Round($Images[$i].ImageSize / 1GB, 1)
+        $index = $Images[$i].ImageIndex
+        $name = $Images[$i].ImageName
+        
+        Write-Host "  [$index] $name" -ForegroundColor White
+        Write-Host "      Tamaño: $sizeGB GB" -ForegroundColor Gray
+        Write-Host ""
+    }
+    
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+    
+    while ($true) {
+        $selected = Get-UserInput -Prompt "Ingresa el número de la edición a personalizar (ej: 1)" -AllowCancel $true
+        
+        # Verificar si es número válido
+        if ([int]::TryParse($selected, [ref]$null)) {
+            $selectedImage = $Images | Where-Object { $_.ImageIndex -eq [int]$selected }
+            if ($selectedImage) {
+                Write-Host "`n✓ Edición seleccionada: " -NoNewline -ForegroundColor Green
+                Write-Host "$($selectedImage.ImageName)" -ForegroundColor White
+                return $selectedImage
+            } else {
+                Write-Host "ERROR: Edición '$selected' no válida. Intenta de nuevo." -ForegroundColor Red
+            }
+        } else {
+            Write-Host "ERROR: Ingresa un número válido." -ForegroundColor Red
+        }
+    }
+}
+
+#---------[ FUNCIÓN OPTIMIZADA: MOUNT AND PROCESS ]---------
+function Mount-And-Process {
+    param(
+        [string]$ImagePath,
+        [int]$Index,
+        [string]$EditionName
+    )
+    
+    Write-Log "=== PROCESANDO EDICIÓN: $EditionName ==="
+    
+    # Variables para el progreso
+    $originalSize = [math]::Round((Get-Item $ImagePath).Length / 1GB, 2)
+    $tempWim = "$TempDir\processed_edition_$(Get-Date -Format 'HHmmss').wim"
+    
+    Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "     PROCESANDO: $EditionName" -ForegroundColor Cyan
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+    
+    try {
+        # Paso 1: Montar imagen
+        Write-Host "⏳ Montando imagen..." -ForegroundColor Cyan
+        
+        # Asegurar que el directorio está vacío
+        if (Test-Path "$MountDir\*") {
+            Remove-Item "$MountDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        
+        # Montar con DISM
+        try {
+            Mount-WindowsImage -ImagePath $ImagePath -Index $Index -Path $MountDir -ErrorAction Stop | Out-Null
+            Write-Host "✓ Imagen montada" -ForegroundColor Green
+        } catch {
+            Write-Host "✗ ERROR: No se pudo montar la imagen" -ForegroundColor Red
+            Write-Host "Detalles: ${_}" -ForegroundColor Yellow
+            Write-Log "ERROR montando imagen: ${_}" -Level "ERROR"
+            return $false
+        }
+        
+        # Paso 2: Aplicar registros
+        Write-Host "⏳ Aplicando registros de personalización..." -ForegroundColor Cyan
+        if (-not (Apply-Registry)) {
+            Write-Host "✗ ERROR aplicando registros" -ForegroundColor Red
+            # Desmontar y limpiar
+            Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+            return $false
+        }
+        
+        # Paso 3: Eliminar bloatware
+        Write-Host "⏳ Eliminando aplicaciones preinstaladas..." -ForegroundColor Cyan
+        $removedApps = Remove-Bloatware
+        Write-Host "✓ $removedApps apps eliminadas" -ForegroundColor Green
+        
+        # Paso 4: Limpiar Menú Inicio
+        Write-Host "⏳ Configurando Menú Inicio..." -ForegroundColor Cyan
+        $startMenuCleaned = Clean-StartMenu
+        if ($startMenuCleaned -gt 0) {
+            Write-Host "✓ Menú Inicio limpiado ($startMenuCleaned accesos eliminados)" -ForegroundColor Green
+        }
+        
+        # Paso 5: Desmontar y exportar en un solo paso (FLUJO OPTIMIZADO)
+        Write-Host "⏳ Exportando imagen optimizada..." -ForegroundColor Cyan
+        Write-Host "   Este paso puede tardar varios minutos..." -ForegroundColor Gray
+        
+        $startTime = Get-Date
+        
+        # Preparar argumentos para DISM
+        $exportArgs = @(
+            "/Export-Image",
+            "/SourceImageFile:`"$ImagePath`"",
+            "/SourceIndex:$Index",
+            "/DestinationImageFile:`"$tempWim`"",
+            "/Compress:max",
+            "/CheckIntegrity"
+        )
+        
+        # Crear archivo de log para DISM
+        $dismLog = "$LogsDir\dism_export_$(Get-Date -Format 'HHmmss').log"
+        
+        # Configurar proceso DISM
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = "dism.exe"
+        $processInfo.Arguments = $exportArgs -join " "
+        $processInfo.RedirectStandardOutput = $false
+        $processInfo.RedirectStandardError = $true
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+        
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        $process.Start() | Out-Null
+        
+        # Variables para monitoreo
+        $processStart = Get-Date
+        $lastUpdate = $processStart
+        $spinnerIndex = 0
+        $spinner = @('|', '/', '-', '\')
+        
+        # Monitorear el proceso
+        while (-not $process.HasExited) {
+            $elapsed = (Get-Date) - $processStart
+            $minutes = [math]::Floor($elapsed.TotalMinutes)
+            $seconds = [math]::Round($elapsed.TotalSeconds % 60)
+            
+            # Actualizar cada 2 segundos
+            if (((Get-Date) - $lastUpdate).TotalSeconds -ge 2) {
+                Write-Host "`r[$($minutes.ToString('00')):$($seconds.ToString('00'))] Exportando $($spinner[$spinnerIndex % 4])" -NoNewline -ForegroundColor Cyan
+                
+                # Si el archivo temporal existe, mostrar su tamaño
+                if (Test-Path $tempWim) {
+                    $currentSize = [math]::Round((Get-Item $tempWim).Length / 1MB, 1)
+                    Write-Host " [Progreso: $currentSize MB]" -NoNewline -ForegroundColor Yellow
+                } else {
+                    Write-Host " [Iniciando exportación...]" -NoNewline -ForegroundColor Gray
+                }
+                
+                $lastUpdate = Get-Date
+                $spinnerIndex++
+            }
+            
+            Start-Sleep -Milliseconds 100
+        }
+        
+        # Limpiar línea
+        Write-Host ""
+        
+        # Verificar resultado de DISM
+        if ($process.ExitCode -eq 0) {
+            if (Test-Path $tempWim) {
+                $finalSize = [math]::Round((Get-Item $tempWim).Length / 1GB, 2)
+                $elapsedTotal = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+                $savings = $originalSize - $finalSize
+                
+                Write-Host "`n✅ Exportación completada exitosamente!" -ForegroundColor Green
+                Write-Host "   Tiempo transcurrido: $elapsedTotal minutos" -ForegroundColor Gray
+                Write-Host "   Tamaño original: $originalSize GB" -ForegroundColor Gray
+                Write-Host "   Tamaño final: $finalSize GB" -ForegroundColor Gray
+                
+                if ($savings -gt 0) {
+                    $reductionPercent = [math]::Round(($savings / $originalSize) * 100, 1)
+                    Write-Host "   Reducción: $([math]::Round($savings, 2)) GB ($reductionPercent%)" -ForegroundColor Green
+                }
+                
+                # Reemplazar archivo original
+                Write-Host "`n🔄 Reemplazando archivo original..." -ForegroundColor Yellow
+                
+                # Primero desmontar la imagen
+                try {
+                    Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction Stop | Out-Null
+                } catch {
+                    Write-Host "  Advertencia: No se pudo desmontar la imagen normalmente" -ForegroundColor Yellow
+                }
+                
+                # Esperar y reemplazar
+                Start-Sleep -Seconds 2
+                
+                # Hacer backup del original
+                $backupPath = "$ImagePath.backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                if (Test-Path $ImagePath) {
+                    Copy-Item $ImagePath $backupPath -Force -ErrorAction SilentlyContinue
+                }
+                
+                # Reemplazar original
+                Remove-Item $ImagePath -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                Move-Item $tempWim $ImagePath -Force -ErrorAction Stop
+                
+                Write-Host "✅ Archivo reemplazado exitosamente" -ForegroundColor Green
+                Write-Host "   Backup guardado como: $(Split-Path $backupPath -Leaf)" -ForegroundColor Gray
+                
+                # Log detallado
+                Write-Log "✓ Proceso completado: $originalSize GB → $finalSize GB ($elapsedTotal minutos)"
+                Write-Log "  Edición procesada: $EditionName"
+                Write-Log "  Aplicaciones eliminadas: $removedApps"
+                Write-Log "  Menú Inicio limpiado: $startMenuCleaned accesos"
+                
+                return $true
+            } else {
+                Write-Host "❌ ERROR: Archivo temporal no se creó" -ForegroundColor Red
+                Write-Log "ERROR: Archivo temporal no se creó" -Level "ERROR"
+                return $false
+            }
+        } else {
+            $errorOutput = $process.StandardError.ReadToEnd()
+            Write-Host "❌ ERROR en DISM (código $($process.ExitCode))" -ForegroundColor Red
+            Write-Host "Detalles: $errorOutput" -ForegroundColor Yellow
+            Write-Log "ERROR DISM (código $($process.ExitCode)): $errorOutput" -Level "ERROR"
+            return $false
+        }
+        
+    } catch {
+        Write-Host "`n❌ ERROR en proceso: ${_}" -ForegroundColor Red
+        Write-Log "ERROR en proceso: ${_}" -Level "ERROR"
+        
+        # Limpiar en caso de error
+        if (Test-Path "$MountDir\*") {
+            try {
+                Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+            } catch {}
+        }
+        
+        return $false
+    } finally {
+        # Limpiar archivo temporal si existe y no se movió
+        if (Test-Path $tempWim) {
+            Remove-Item $tempWim -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Apply-Registry {
+    Write-Log "Aplicando registros de personalización..."
+    
+    Write-Host "  Aplicando registros..." -NoNewline -ForegroundColor Gray
+    
+    # Registros para install.wim (sistema instalado)
+    $regInstall = @'
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\Setup\LabConfig]
+"BypassTPMCheck"=dword:00000001
+"BypassRAMCheck"=dword:00000001
+"BypassSecureBootCheck"=dword:00000001
+"BypassCPUCheck"=dword:00000001
+"BypassStorageCheck"=dword:00000001
+"BypassDiskCheck"=dword:00000001
+"BypassAccountCheck"=dword:00000001
+"BypassInternetCheck"=dword:00000001
+"AllowUpgradesWithUnsupportedTPMOrCPU"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE]
+"BypassNRO"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\OEM\Device\Capture]
+"NoPhysicalCameraLED"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\OneDrive]
+"DisableFileSyncNGSC"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Device Metadata]
+"PreventDeviceMetadataFromNetwork"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\DriverSearching]
+"DontSearchWindowsUpdate"=dword:00000000
+"DontPromptForWindowsUpdate"=dword:00000001
+"DriverUpdateWizardWuSearchEnabled"=dword:00000000
+"SearchOrderConfig"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching]
+"SearchOrderConfig"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU]
+"AUOptions"=dword:00000002
+"ExcludeWUDriversInQualityUpdate"=dword:00000001
+"NoAutoRebootWithLoggedOnUsers"=dword:00000001
+"AUPowerManagement"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings]
+"BranchReadinessLevel"=dword:00000014
+"DeferFeatureUpdatesPeriodInDays"=dword:000000b4
+"DeferQualityUpdatesPeriodInDays"=dword:000000b4
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion]
+"DeviceInstallDisabled"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows Defender\Scan]
+"AvgCPULoadFactor"=dword:00000025
+'@
+    
+    # Guardar archivo .reg temporal
+    $regFile = "$TempDir\install_registry.reg"
+    $regInstall | Out-File -FilePath $regFile -Encoding Unicode
+    
+    # Lista para trackear hives cargados
+    $hivesLoaded = @()
+    
+    try {
+        # Cargar hive SYSTEM
+        reg load "HKLM\TempSystem" "$MountDir\Windows\System32\config\SYSTEM" 2>&1 | Out-Null
+        $hivesLoaded += "TempSystem"
+        
+        # Aplicar registros
+        reg import $regFile 2>&1 | Out-Null
+        
+        # Descargar hive
+        reg unload "HKLM\TempSystem" 2>&1 | Out-Null
+        $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne "TempSystem" }
+        
+        # Cargar hive SOFTWARE
+        reg load "HKLM\TempSoftware" "$MountDir\Windows\System32\config\SOFTWARE" 2>&1 | Out-Null
+        $hivesLoaded += "TempSoftware"
+        
+        # Aplicar registros
+        reg import $regFile 2>&1 | Out-Null
+        
+        # Descargar hive
+        reg unload "HKLM\TempSoftware" 2>&1 | Out-Null
+        $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne "TempSoftware" }
+        
+        Write-Host " ✓" -ForegroundColor Green
+        Write-Log "✓ Registros aplicados exitosamente"
+        return $true
+    } catch {
+        Write-Host " ✗" -ForegroundColor Red
+        Write-Log "ERROR aplicando registros: ${_}" -Level "ERROR"
+        return $false
+    } finally {
+        # DESCARGAR CUALQUIER HIVE QUE HAYA QUEDADO CARGADO
+        foreach ($hive in $hivesLoaded) {
+            try {
+                reg unload "HKLM\$hive" 2>&1 | Out-Null
+                Write-Log "  Hive descargado en finally: $hive" -Level "DEBUG"
+            } catch {
+                Write-Log "  No se pudo descargar hive ${hive}: ${_}" -Level "WARNING"
+            }
+        }
+        
+        # Limpiar archivo temporal si existe
+        if (Test-Path $regFile) {
+            Remove-Item $regFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Remove-Bloatware {
+    Write-Log "=== ELIMINANDO APLICACIONES PREINSTALADAS (CONSERVANDO XBOX Y ESENCIALES) ==="
+    
+    Write-Host "  Eliminando bloatware selectivo..." -NoNewline -ForegroundColor Gray
+    
+    # APPS QUE SÍ DEBEN ELIMINARSE (Bloatware indeseado) - SIN NADA DE XBOX
+    $appsToRemove = @(
+        # Bing y servicios relacionados
+        '*BingNews*',
+        '*BingWeather*', 
+        '*BingSearch*',
+        '*BingFinance*',
+        '*BingSports*',
+        
+        # Microsoft apps promocionales
+        '*GetHelp*',
+        '*Getstarted*',
+        '*MicrosoftSolitaireCollection*',
+        '*MicrosoftStickyNotes*',  # Se elimina (Windows tiene Notepad)
+        '*MicrosoftOfficeHub*',
+        '*Office.OneNote*',
+        '*PowerAutomateDesktop*',
+        '*Clipchamp*',
+        '*DevHome*',
+        '*QuickAssist*',
+        '*Microsoft3DViewer*',  # Se elimina (conservamos Paint 3D)
+        
+        # Comunicación y redes sociales
+        '*SkypeApp*',
+        '*Teams*',
+        '*People*',  # Contactos/Personas
+        '*Todos*',   # Microsoft To-Do
+        
+        # Apps duplicadas/innecesarias
+        '*WindowsCommunicationsApps*',  # Mail y Calendar (duplicados)
+        '*WindowsFeedbackHub*',
+        '*WindowsAlarms*',  # Se elimina (hay apps de terceros mejores)
+        '*WindowsMaps*',
+        '*OutlookForWindows*',  # Nuevo Outlook
+        
+        # Otras apps innecesarias
+        '*Wallet*',
+        '*MixedReality.Portal*',
+        '*ScreenSketch*',  # Recortes (hay herramientas nativas)
+        '*WindowsWebExperiencePack*'  # Widgets
+        
+        # NOTA: NADA DE XBOX SE ELIMINA - TODO SE CONSERVA
+    )
+    
+    # APPS QUE DEBEN CONSERVARSE (NO ELIMINAR) - INCLUYENDO TODO XBOX
+    $appsToKeep = @(
+        # Navegador y cloud
+        '*Edge*',
+        '*MicrosoftEdge*',
+        '*OneDrive*',
+        '*YourPhone*',
+        
+        # Multimedia y codecs del sistema
+        '*WindowsCamera*',
+        '*WindowsSoundRecorder*',
+        '*ZuneMusic*',
+        '*ZuneVideo*',
+        '*MediaPlayer*',
+        '*Dolby*',
+        
+        # Utilidades del sistema
+        '*Paint*',       # Incluye Paint y Paint 3D
+        '*MSPaint*',
+        '*Paint3D*',
+        '*Notepad*',
+        '*Calculator*',  # Calculadora
+        '*WindowsCalculator*',
+        
+        # TODO XBOX SE CONSERVA
+        '*Xbox*',        # TODO lo relacionado con Xbox
+        '*GameBar*',     # Game Bar
+        '*XboxGameOverlay*',
+        '*XboxGamingOverlay*',
+        '*XboxIdentityProvider*',
+        '*XboxSpeechToTextOverlay*',
+        '*Xbox.TCUI*',
+        '*XboxApp*',
+        '*XboxLive*',
+        '*XboxConsole*',
+        '*XboxGameCallableUI*',
+        '*XboxGaming*',
+        '*XboxIdentity*',
+        '*XboxSpeech*',
+        '*Xbox.TCUI*',
+        '*Game.CallableUI*',
+        '*GamingApp*',
+        '*GamingOverlay*',
+        '*GamingServices*',
+        '*GamingUI*',
+        
+        # Sistema y codecs esenciales
+        '*VCLibs*',      # Runtime libraries
+        '*NET.Native*',  # .NET Runtime
+        '*VCORE*',       # Visual C++ Runtime
+        '*WebMediaExtensions*',  # Codecs web
+        '*HEIFImageExtension*',  # HEIC/HEIF
+        '*AV1VideoExtension*',   # Codec AV1
+        '*VP9VideoExtensions*',  # Codec VP9
+        '*RawImageExtension*',   # RAW images
+        
+        # Subsistema y framework
+        '*WindowsStore*',        # Microsoft Store (necesario para updates)
+        '*AppInstaller*',        # Instalador de apps
+        '*NETRuntime*',
+        '*VCLib*',
+        
+        # Sistema base (Windows)
+        '*Windows.Client*',
+        '*Windows.Desktop*',
+        '*Windows.Feature*',
+        '*Windows.System*',
+        '*Windows.UI*',
+        '*Windows.Web*',
+        '*Microsoft.Windows.*',  # Todo lo de Microsoft.Windows
+        
+        # Asegurar subsistema de apps
+        '*Appx*',
+        '*Win32*',
+        '*UWP*',
+        '*DesktopApp*'
+    )
+    
+    $removedCount = 0
+    $keptCount = 0
+    $errorCount = 0
+    
+    Write-Log "Obteniendo lista de paquetes provisionados..."
+    
+    try {
+        # Obtener TODOS los paquetes
+        $dismResult = & dism.exe /English /Image:"$MountDir" /Get-ProvisionedAppxPackages 2>&1
+        $dismLines = @($dismResult) -split "`r`n"
+        
+        # Extraer nombres de paquetes
+        $allPackages = @()
+        foreach ($line in $dismLines) {
+            if ($line -match 'PackageName\s*:\s*(.+)' -or 
+                $line -match 'Package Identity\s*:\s*(.+)' -or
+                $line -match 'Package Identity Name\s*:\s*(.+)') {
+                $pkgName = $matches[1].Trim()
+                if ($pkgName -and $pkgName -ne '') {
+                    $allPackages += $pkgName
+                }
+            }
+        }
+        
+        Write-Log "Total de paquetes encontrados: $($allPackages.Count)"
+        
+        # Filtrar: Primero identificar qué conservar
+        $packagesToKeep = @()
+        foreach ($package in $allPackages) {
+            $shouldKeep = $false
+            
+            # Verificar si está en la lista de conservar
+            foreach ($keepPattern in $appsToKeep) {
+                if ($package -like $keepPattern) {
+                    $shouldKeep = $true
+                    $packagesToKeep += $package
+                    $keptCount++
+                    break
+                }
+            }
+        }
+        
+        # Ahora identificar qué eliminar (solo los que NO están en conservar Y están en eliminar)
+        $packagesToRemove = @()
+        foreach ($package in $allPackages) {
+            # Si ya está marcado para conservar, saltar
+            if ($packagesToKeep -contains $package) {
+                continue
+            }
+            
+            # Verificar si está en la lista de eliminar
+            $shouldRemove = $false
+            foreach ($removePattern in $appsToRemove) {
+                if ($package -like $removePattern) {
+                    $shouldRemove = $true
+                    break
+                }
+            }
+            
+            if ($shouldRemove) {
+                $packagesToRemove += $package
+            } else {
+                # Si no está ni en conservar ni en eliminar, dejarlo (apps del sistema desconocidas)
+                $keptCount++
+            }
+        }
+        
+        Write-Log "=== RESUMEN DE ACCIONES ==="
+        Write-Log "  - Total paquetes encontrados: $($allPackages.Count)"
+        Write-Log "  - Paquetes a conservar: $keptCount"
+        Write-Log "  - Paquetes a eliminar: $($packagesToRemove.Count)"
+        
+        # Eliminar los paquetes seleccionados
+        if ($packagesToRemove.Count -gt 0) {
+            Write-Log "Iniciando eliminación de bloatware..."
+            
+            foreach ($package in $packagesToRemove) {
+                $shortName = if ($package.Length -gt 40) { $package.Substring(0, 37) + "..." } else { $package }
+                
+                Write-Log "Procesando: $shortName"
+                
+                # Intentar eliminación con DISM
+                $removeResult = & dism.exe /English /Image:"$MountDir" /Remove-ProvisionedAppxPackage /PackageName:"$package" 2>&1
+                
+                # Verificar éxito
+                $success = $false
+                foreach ($line in $removeResult) {
+                    if ($line -match 'completed successfully' -or 
+                        $line -match 'se realizó correctamente' -or 
+                        $line -match 'se completó correctamente' -or
+                        $line -match 'The operation completed successfully' -or
+                        $line -match '100%') {
+                        $success = $true
+                        break
+                    }
+                }
+                
+                if ($success) {
+                    $removedCount++
+                    Write-Log "  ✓ Eliminado exitosamente" -Level "INFO"
+                } else {
+                    # Verificar si ya no existe
+                    if ($removeResult -match 'not found' -or $removeResult -match 'no se encontró' -or $removeResult -match 'does not exist') {
+                        $removedCount++
+                        Write-Log "  ✓ Ya no existe" -Level "INFO"
+                    } else {
+                        $errorCount++
+                        Write-Log "  ✗ Error al eliminar" -Level "WARNING"
+                    }
+                }
+                
+                # Pequeña pausa para no sobrecargar
+                Start-Sleep -Milliseconds 200
+            }
+        } else {
+            Write-Log "No se encontraron paquetes para eliminar según los criterios" -Level "INFO"
+        }
+        
+    } catch {
+        Write-Log "ERROR en proceso de eliminación: ${_}" -Level "ERROR"
+        $errorCount++
+    }
+    
+    # Resultado final
+    if ($removedCount -gt 0) {
+        Write-Host " ✓ ($removedCount apps eliminadas, $keptCount conservadas)" -ForegroundColor Green
+    } else {
+        Write-Host " ✓ (0 apps eliminadas, $keptCount conservadas)" -ForegroundColor Yellow
+    }
+    
+    Write-Log "=== RESULTADO FINAL ==="
+    Write-Log "Aplicaciones eliminadas: $removedCount"
+    Write-Log "Aplicaciones conservadas: $keptCount"
+    Write-Log "Errores durante el proceso: $errorCount"
+    
+    if ($errorCount -gt 0) {
+        Write-Log "ADVERTENCIA: Hubo $errorCount errores durante la eliminación" -Level "WARNING"
+    }
+    
+    return $removedCount
+}
+
+function Clean-StartMenu {
+    Write-Log "=== LIMPIANDO MENÚ INICIO (VERSIÓN MEJORADA) ==="
+    
+    Write-Host "  Configurando Menú Inicio completamente limpio..." -NoNewline -ForegroundColor Gray
+    
+    $removedShortcuts = 0
+    $addedEdgeShortcut = $false
+    
+    # Lista para trackear hives cargados
+    $hivesLoaded = @()
+    
+    try {
+        # PASO 1: Limpiar accesos directos del usuario
+        $publicStartMenu = "$MountDir\ProgramData\Microsoft\Windows\Start Menu\Programs"
+        $userStartMenu = "$MountDir\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+        
+        # Asegurar que existen los directorios
+        if (-not (Test-Path $publicStartMenu)) {
+            New-Item -ItemType Directory -Path $publicStartMenu -Force | Out-Null
+        }
+        if (-not (Test-Path $userStartMenu)) {
+            New-Item -ItemType Directory -Path $userStartMenu -Force | Out-Null
+        }
+        
+        Write-Log "  Directorios de Start Menu verificados"
+        
+        # Limpiar accesos directos del usuario
+        Write-Log "  Limpiando accesos directos del usuario..."
+        if (Test-Path "$userStartMenu\*") {
+            Get-ChildItem -Path "$userStartMenu\*" -Include "*.lnk", "*.url" -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+                    $removedShortcuts++
+                } catch {
+                    Write-Log "    Error eliminando $($_.Name): ${_}" -Level "WARNING"
+                }
+            }
+        }
+        
+        # Limpiar accesos directos públicos (excepto esenciales)
+        Write-Log "  Limpiando accesos directos públicos..."
+        if (Test-Path "$publicStartMenu\*") {
+            # Conservar solo lo esencial
+            $essentialItems = @(
+                "Microsoft Edge.lnk",
+                "Windows PowerShell.lnk",
+                "Command Prompt.lnk",
+                "Windows Terminal.lnk",
+                "System Tools",
+                "Accessories",
+                "Maintenance",
+                "Administrative Tools"
+            )
+            
+            Get-ChildItem -Path "$publicStartMenu\*" -ErrorAction SilentlyContinue | ForEach-Object {
+                $keepItem = $false
+                
+                # Verificar si es esencial
+                foreach ($essential in $essentialItems) {
+                    if ($_.Name -eq $essential) {
+                        $keepItem = $true
+                        break
+                    }
+                }
+                
+                # Verificar si es carpeta de sistema
+                if ($_.PSIsContainer) {
+                    if ($_.Name -in @("System Tools", "Accessories", "Maintenance", "Administrative Tools")) {
+                        $keepItem = $true
+                    }
+                }
+                
+                # Eliminar si no es esencial
+                if (-not $keepItem) {
+                    try {
+                        Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        $removedShortcuts++
+                    } catch {
+                        Write-Log "    Error eliminando $($_.Name): ${_}" -Level "WARNING"
+                    }
+                }
+            }
+        }
+        
+        # PASO 2: Configurar políticas para Start Menu vacío
+        Write-Log "  Configurando políticas del registro para Menú Inicio vacío..."
+        
+        # Cargar hive SOFTWARE
+        $softwareHive = "$MountDir\Windows\System32\config\SOFTWARE"
+        if (Test-Path $softwareHive) {
+            reg load HKLM\TempSOFTWARE $softwareHive 2>&1 | Out-Null
+            $hivesLoaded += "TempSOFTWARE"
+            
+            # Políticas para deshabilitar todo en Start Menu
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v HideRecentlyAddedApps /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v HideStartMenuSuggestions /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowClassicMode /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowRun /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowMyComputer /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowMyDocuments /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowUser /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowMyMusic /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowMyPictures /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowControlPanel /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowHelp /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v Start_ShowSetProgramAccessAndDefaults /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v StartMenuLogOff /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v NoStartMenuMorePrograms /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v NoStartMenuMFUprogramsList /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            
+            # Deshabilitar anuncios y promociones
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableThirdPartySuggestions /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsSpotlightFeatures /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            
+            # Configurar layout vacío
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v LockedStartLayout /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            
+            # Crear layout vacío XML
+            $layoutContent = @'
+<?xml version="1.0" encoding="utf-8"?>
+<LayoutModificationTemplate
+    xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
+    xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout"
+    xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
+    xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
+    Version="1">
+    
+    <LayoutOptions StartTileGroupCellWidth="6" />
+    
+    <!-- BARRA DE TAREAS: Solo Edge y Configuración -->
+    <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+        <defaultlayout:TaskbarLayout>
+            <taskbar:TaskbarPinList>
+                <!-- Microsoft Edge -->
+                <taskbar:DesktopApp DesktopApplicationLinkPath="%APPDATA%\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" />
+                <!-- Configuración (Settings) -->
+                <taskbar:UWA AppUserModelID="windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" />
+            </taskbar:TaskbarPinList>
+        </defaultlayout:TaskbarLayout>
+    </CustomTaskbarLayoutCollection>
+    
+    <!-- MENÚ INICIO: Completamente vacío - NO tiles -->
+    <DefaultLayoutOverride LayoutCustomizationRestrictionType="OnlySpecifiedGroups">
+        <StartLayoutCollection>
+            <defaultlayout:StartLayout GroupCellWidth="6">
+                <!-- Grupo vacío -->
+                <start:Group Name="">
+                    <!-- Sin tiles -->
+                </start:Group>
+            </defaultlayout:StartLayout>
+        </StartLayoutCollection>
+    </DefaultLayoutOverride>
+    
+</LayoutModificationTemplate>
+'@
+            
+            # Guardar el archivo XML
+            $layoutPath = "$MountDir\ProgramData\Microsoft\Windows\Start Menu\LayoutModification.xml"
+            $layoutContent | Out-File -FilePath $layoutPath -Encoding UTF8 -Force
+            
+            # Configurar la ruta del layout
+            reg add "HKLM\TempSOFTWARE\Policies\Microsoft\Windows\Explorer" /v StartLayoutFile /t REG_SZ /d "%ProgramData%\Microsoft\Windows\Start Menu\LayoutModification.xml" /f 2>&1 | Out-Null
+            
+            # Descargar hive
+            reg unload HKLM\TempSOFTWARE 2>&1 | Out-Null
+            $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne "TempSOFTWARE" }
+            
+            Write-Log "  Políticas del Menú Inicio configuradas"
+        }
+        
+        # PASO 3: Limpiar configuraciones del usuario por defecto
+        Write-Log "  Limpiando configuraciones del usuario Default..."
+        
+        # Cargar hive DEFAULT
+        $defaultHive = "$MountDir\Windows\System32\config\default"
+        if (Test-Path $defaultHive) {
+            reg load HKLM\TempDEFAULT $defaultHive 2>&1 | Out-Null
+            $hivesLoaded += "TempDEFAULT"
+            
+            # Limpiar tiles del menú Inicio
+            $startMenuKey = "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount"
+            if (Test-Path "Registry::$startMenuKey") {
+                # Eliminar la caché de tiles
+                Remove-Item -Path "Registry::$startMenuKey" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Limpiar tiles anclados
+            $startLayoutKey = "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\StartLayout"
+            if (Test-Path "Registry::$startLayoutKey") {
+                Remove-Item -Path "Registry::$startLayoutKey" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Configurar Start Menu vacío
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_TrackProgs /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_TrackDocs /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v StartMenuInit /t REG_DWORD /d 4 /f 2>&1 | Out-Null
+            
+            # Deshabilitar sugerencias
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-338393Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-353694Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-353696Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempDEFAULT\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SystemPaneSuggestionsEnabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            
+            # Descargar hive
+            reg unload HKLM\TempDEFAULT 2>&1 | Out-Null
+            $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne "TempDEFAULT" }
+        }
+        
+        # PASO 4: Configurar NTUSER.DAT del usuario Default
+        Write-Log "  Configurando NTUSER.DAT del usuario Default..."
+        
+        $ntuserPath = "$MountDir\Users\Default\ntuser.dat"
+        if (Test-Path $ntuserPath) {
+            reg load HKLM\TempNTUSER $ntuserPath 2>&1 | Out-Null
+            $hivesLoaded += "TempNTUSER"
+            
+            # Limpiar tiles del menú Inicio
+            $startMenuKey = "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount"
+            if (Test-Path "Registry::$startMenuKey") {
+                Remove-Item -Path "Registry::$startMenuKey" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Limpiar tiles anclados
+            $startLayoutKey = "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartLayout"
+            if (Test-Path "Registry::$startLayoutKey") {
+                Remove-Item -Path "Registry::$startLayoutKey" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Configurar Start Menu vacío
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_TrackProgs /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_TrackDocs /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_ShowRun /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v StartMenuInit /t REG_DWORD /d 4 /f 2>&1 | Out-Null
+            
+            # Deshabilitar sugerencias
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-338393Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-353694Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-353696Enabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SystemPaneSuggestionsEnabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            
+            # Configurar menú Inicio clásico (Windows 10/11)
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Start_ShowClassicMode /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            
+            # Deshabilitar anuncios
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SoftLandingEnabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v RotatingLockScreenEnabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            reg add "HKLM\TempNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v RotatingLockScreenOverlayEnabled /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            
+            # Descargar hive
+            reg unload HKLM\TempNTUSER 2>&1 | Out-Null
+            $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne "TempNTUSER" }
+        }
+        
+        # PASO 5: Crear acceso directo de Edge si no existe
+        $edgeLnkPath = "$publicStartMenu\Microsoft Edge.lnk"
+        if (-not (Test-Path $edgeLnkPath)) {
+            Write-Log "  Creando acceso directo de Microsoft Edge..."
+            
+            $edgeLnkContent = @"
+[InternetShortcut]
+URL=https://www.microsoft.com/edge
+IDList=
+IconFile=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+IconIndex=0
+HotKey=0
+"@
+            
+            $edgeLnkContent | Out-File -FilePath $edgeLnkPath -Encoding ASCII -Force
+            $addedEdgeShortcut = $true
+        }
+        
+        Write-Host " ✓ ($removedShortcuts accesos eliminados)" -ForegroundColor Green
+        Write-Log "✓ Menú Inicio limpiado completamente: $removedShortcuts accesos directos eliminados"
+        if ($addedEdgeShortcut) {
+            Write-Log "  ✓ Acceso directo de Edge creado"
+        }
+        
+        return $removedShortcuts
+        
+    } catch {
+        Write-Host " ✗" -ForegroundColor Red
+        Write-Log "ERROR limpiando Menú Inicio: ${_}" -Level "ERROR"
+        return 0
+    } finally {
+        # DESCARGAR CUALQUIER HIVE QUE HAYA QUEDADO CARGADO
+        foreach ($hive in $hivesLoaded) {
+            try {
+                reg unload "HKLM\$hive" 2>&1 | Out-Null
+                Write-Log "  Hive descargado en finally: $hive" -Level "DEBUG"
+            } catch {
+                Write-Log "  No se pudo descargar hive $hive en finally" -Level "WARNING"
+            }
+        }
+    }
+}
+
+#---------[ FUNCIÓN CORREGIDA: PROCESS-BOOTWIM ]---------
+function Process-BootWim {
+    Write-Log "=== PROCESANDO BOOT.WIM (MÉTODO SIMPLE Y ROBUSTO) ==="
+    
+    $bootWimPath = "$SourcesDir\boot.wim"
+    if (-not (Test-Path $bootWimPath)) {
+        Write-Host "❌ ERROR: boot.wim no encontrado en $SourcesDir" -ForegroundColor Red
+        Write-Log "ERROR: boot.wim no encontrado" -Level "ERROR"
+        return $false
+    }
+    
+    Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "        PROCESANDO BOOT.WIM - MÉTODO SIMPLE" -ForegroundColor Cyan
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host ""
+    
+    # Variable para trackear hives cargados
+    $hivesLoaded = @()
+    
+    try {
+        # Obtener información del boot.wim
+        $bootImages = Get-WindowsImage -ImagePath $bootWimPath -ErrorAction Stop
+        Write-Host "📊 Boot.wim encontrado con $($bootImages.Count) imágenes" -ForegroundColor White
+        
+        # Procesar cada índice encontrado
+        foreach ($bootImage in $bootImages) {
+            $index = $bootImage.ImageIndex
+            $imageName = $bootImage.ImageName
+            
+            Write-Host "`n[PROCESANDO] Índice ${index}: ${imageName}" -ForegroundColor Cyan
+            
+            # 1. Limpiar directorio de montaje
+            Write-Host "  Limpiando directorio de montaje..." -NoNewline -ForegroundColor Gray
+            if (Test-Path "$MountDir\*") {
+                Remove-Item "$MountDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+            }
+            Write-Host " ✓" -ForegroundColor Green
+            
+            # 2. Montar imagen
+            Write-Host "  Montando imagen..." -NoNewline -ForegroundColor Gray
+            try {
+                Mount-WindowsImage -ImagePath $bootWimPath -Index $index -Path $MountDir -ErrorAction Stop | Out-Null
+                Write-Host " ✓" -ForegroundColor Green
+            } catch {
+                Write-Host " ✗" -ForegroundColor Red
+                Write-Host "    ERROR: No se pudo montar índice ${index}" -ForegroundColor Yellow
+                Write-Log "ERROR montando boot.wim índice ${index}: ${_}" -Level "ERROR"
+                continue
+            }
+            
+            # 3. Cargar todos los hives de registro (CRÍTICO)
+            Write-Host "  Cargando hives de registro..." -NoNewline -ForegroundColor Gray
+            
+            # Reiniciar la lista de hives para cada imagen
+            $currentHivesLoaded = @()
+            
+            # Mapeo de hives y sus rutas
+            $hives = @{
+                "zCOMPONENTS" = "$MountDir\Windows\System32\config\COMPONENTS"
+                "zDEFAULT" = "$MountDir\Windows\System32\config\default"
+                "zNTUSER" = "$MountDir\Users\Default\ntuser.dat"
+                "zSOFTWARE" = "$MountDir\Windows\System32\config\SOFTWARE"
+                "zSYSTEM" = "$MountDir\Windows\System32\config\SYSTEM"
+            }
+            
+            # Cargar cada hive que exista
+            foreach ($hiveName in $hives.Keys) {
+                $hivePath = $hives[$hiveName]
+                if (Test-Path $hivePath) {
+                    $result = reg load "HKLM\$hiveName" $hivePath 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $currentHivesLoaded += $hiveName
+                        $hivesLoaded += $hiveName
+                    }
+                }
+            }
+            
+            Write-Host " ✓ ($($currentHivesLoaded.Count)/5 hives)" -ForegroundColor Green
+            
+            # 4. Aplicar registros de bypass (EN TODAS LAS UBICACIONES NECESARIAS)
+            Write-Host "  Aplicando registros de bypass..." -NoNewline -ForegroundColor Gray
+            
+            # Aplicar en DEFAULT si está cargado
+            if ($currentHivesLoaded -contains "zDEFAULT") {
+                # UnsupportedHardwareNotificationCache
+                reg add "HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache" /v SV1 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+                reg add "HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache" /v SV2 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            }
+            
+            # Aplicar en NTUSER si está cargado
+            if ($currentHivesLoaded -contains "zNTUSER") {
+                # UnsupportedHardwareNotificationCache
+                reg add "HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache" /v SV1 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+                reg add "HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache" /v SV2 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            }
+            
+            # Aplicar en SYSTEM si está cargado (MÁS IMPORTANTE)
+            if ($currentHivesLoaded -contains "zSYSTEM") {
+                # LabConfig
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassCPUCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                reg add "HKLM\zSYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+                
+                # MoSetup
+                reg add "HKLM\zSYSTEM\Setup\MoSetup" /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 1 /f 2>&1 | Out-Null
+            }
+            
+            Write-Host " ✓" -ForegroundColor Green
+            
+            # 5. Descargar hives de ESTA imagen específica
+            Write-Host "  Descargando hives..." -NoNewline -ForegroundColor Gray
+            foreach ($hiveName in $currentHivesLoaded) {
+                reg unload "HKLM\$hiveName" 2>&1 | Out-Null
+                # Remover de la lista global también
+                $hivesLoaded = $hivesLoaded | Where-Object { $_ -ne $hiveName }
+            }
+            Write-Host " ✓" -ForegroundColor Green
+            
+            # 6. Desmontar y guardar
+            Write-Host "  Guardando cambios..." -NoNewline -ForegroundColor Gray
+            try {
+                Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
+                Write-Host " ✓" -ForegroundColor Green
+                Write-Log "✓ Boot.wim índice $index procesado exitosamente"
+            } catch {
+                Write-Host " ✗" -ForegroundColor Red
+                Write-Host "    ERROR: No se pudo guardar cambios" -ForegroundColor Yellow
+                Write-Log "ERROR guardando boot.wim índice ${index}: ${_}" -Level "ERROR"
+                # Intentar desmontar sin guardar
+                Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+            }
+        }
+        
+        Write-Host "`n✅ Boot.wim procesado exitosamente" -ForegroundColor Green
+        Write-Log "✓ Boot.wim procesado completamente"
+        return $true
+        
+    } catch {
+        Write-Host "`n❌ ERROR procesando boot.wim: ${_}" -ForegroundColor Red
+        Write-Log "ERROR crítico procesando boot.wim: ${_}" -Level "ERROR"
+        return $false
+        
+    } finally {
+        # DESCARGAR CUALQUIER HIVE QUE HAYA QUEDADO CARGADO
+        # Esto es crucial para evitar bloqueos de archivos
+        if ($hivesLoaded.Count -gt 0) {
+            Write-Log "Descargando hives residuales en bloque finally..." -Level "WARNING"
+            foreach ($hiveName in $hivesLoaded) {
+                try {
+                    reg unload "HKLM\$hiveName" 2>&1 | Out-Null
+                    Write-Log "  Hive descargado: $hiveName" -Level "DEBUG"
+                } catch {
+                    Write-Log "  No se pudo descargar hive ${hiveName}: ${_}" -Level "WARNING"
+                }
+            }
+        }
+        
+        # ASEGURARSE DE QUE EL DIRECTORIO ESTÉ DESMONTADO
+        # Esto previene que quede montado en caso de error
+        if (Test-Path "$MountDir\*") {
+            try {
+                Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+                Write-Log "Imagen desmontada en bloque finally" -Level "DEBUG"
+            } catch {
+                # Ignorar errores si ya estaba desmontado
+            }
+        }
+    }
+}
+
+function Create-ISO {
+    param([string]$EditionName)
+    
+    if (-not $global:CanCreateISO) {
+        Write-Host "`nADVERTENCIA: No se puede crear ISO (falta oscdimg.exe)" -ForegroundColor Yellow
+        Write-Host "La imagen personalizada está en: $SourcesDir" -ForegroundColor Gray
+        Write-Log "ADVERTENCIA: No se puede crear ISO - oscdimg.exe no encontrado" -Level "WARNING"
+        return $null
+    }
+    
+    Write-Log "Creando ISO booteable..."
+    
+    # Nombre de la ISO
+    $cleanName = $EditionName -replace '[^\w\s]', '' -replace '\s+', '_'
+    $isoName = "Windows11_${cleanName}_$(Get-Date -Format 'yyyyMMdd_HHmm').iso"
+    $isoPath = "$WorkingPath\$isoName"
+    
+    # Verificar si ya existe una ISO con ese nombre
+    if (Test-Path $isoPath) {
+        Write-Log "ADVERTENCIA: ISO ya existe, eliminando..." -Level "WARNING"
+        Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Verificar archivos esenciales
+    $etfsboot = "$WindowsDir\boot\etfsboot.com"
+    $efiBoot = "$WindowsDir\efi\microsoft\boot\efisys.bin"
+    
+    $missingFiles = @()
+    if (-not (Test-Path $etfsboot)) {
+        $missingFiles += "boot\etfsboot.com"
+        Write-Log "ADVERTENCIA: etfsboot.com no encontrado" -Level "WARNING"
+    }
+    
+    if (-not (Test-Path $efiBoot)) {
+        $missingFiles += "efi\microsoft\boot\efisys.bin"
+        Write-Log "ADVERTENCIA: efisys.bin no encontrado" -Level "WARNING"
+    }
+    
+    if ($missingFiles.Count -gt 0) {
+        Write-Host "ADVERTENCIA: Faltan archivos de boot" -ForegroundColor Yellow
+        Write-Host "ISO puede no ser booteable" -ForegroundColor Yellow
+    }
+    
+    try {
+        # Optimizar install.wim con DISM (compresión máxima)
+        $installFile = if (Test-Path "$SourcesDir\install.wim") { "$SourcesDir\install.wim" } else { "$SourcesDir\install.esd" }
+        
+        if (Test-Path $installFile) {
+            Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+            Write-Host "     OPTIMIZANDO IMAGEN DE INSTALACIÓN" -ForegroundColor Cyan
+            Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "Este proceso puede tardar varios minutos..." -ForegroundColor Yellow
+            Write-Host "Dependiendo del tamaño de la imagen, puede tardar:" -ForegroundColor Gray
+            Write-Host "  • 5-10 minutos para imágenes pequeñas (4-6 GB)" -ForegroundColor Gray
+            Write-Host "  • 15-30 minutos para imágenes grandes (10+ GB)" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "POR FAVOR, ESPERA... NO CIERRES LA VENTANA" -ForegroundColor Yellow
+            Write-Host ""
+            
+            $tempWim = "$TempDir\optimized_$(Get-Date -Format 'HHmmss').wim"
+            $originalSize = [math]::Round((Get-Item $installFile).Length / 1GB, 2)
+            Write-Log "  Optimizando imagen ($originalSize GB)..."
+            
+            # Mostrar indicador de actividad
+            $activityMessage = "Comprimiendo imagen con DISM (máxima compresión)..."
+            Write-Progress -Activity "Optimizando imagen" -Status $activityMessage -PercentComplete 0
+            
+            # Crear archivo de log específico para DISM
+            $dismLog = "$LogsDir\dism_optimize_$(Get-Date -Format 'HHmmss').log"
+            
+            # Ejecutar DISM sin redirección completa para ver progreso
+            $dismArgs = @(
+                "/Export-Image",
+                "/SourceImageFile:`"$installFile`"",
+                "/SourceIndex:1",
+                "/DestinationImageFile:`"$tempWim`"",
+                "/Compress:max",
+                "/CheckIntegrity",
+                "/LogPath:`"$dismLog`"",
+                "/LogLevel:2"
+            )
+            
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = "dism.exe"
+            $processInfo.Arguments = $dismArgs -join " "
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+            $processInfo.RedirectStandardOutput = $false  # Permitir que DISM muestre su progreso
+            
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            $process.Start() | Out-Null
+            
+            # Monitorear el proceso
+            $startTime = Get-Date
+            $lastUpdate = $startTime
+            
+            while (-not $process.HasExited) {
+                $elapsed = (Get-Date) - $startTime
+                
+                # Actualizar progreso cada 10 segundos
+                if (((Get-Date) - $lastUpdate).TotalSeconds -ge 10) {
+                    $minutes = [math]::Round($elapsed.TotalMinutes, 1)
+                    Write-Host "  [$(Get-Date -Format 'HH:mm:ss')] Procesando... ($minutes minutos transcurridos)" -ForegroundColor Gray
+                    $lastUpdate = Get-Date
+                    
+                    # Si el archivo temporal existe, mostrar su tamaño
+                    if (Test-Path $tempWim) {
+                        $currentSize = [math]::Round((Get-Item $tempWim).Length / 1GB, 2)
+                        Write-Host "  Tamaño actual: $currentSize GB" -ForegroundColor Gray
+                    }
+                }
+                
+                Start-Sleep -Seconds 2
+            }
+            
+            # Limpiar barra de progreso
+            Write-Progress -Activity "Optimizando imagen" -Completed
+            
+            if ($process.ExitCode -eq 0) {
+                if (Test-Path $tempWim) {
+                    $finalSize = [math]::Round((Get-Item $tempWim).Length / 1GB, 2)
+                    $savings = $originalSize - $finalSize
+                    $elapsedTotal = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+                    
+                    Write-Host "`n✓ Optimización completada en $elapsedTotal minutos" -ForegroundColor Green
+                    Write-Host "  Tamaño original: $originalSize GB" -ForegroundColor Gray
+                    Write-Host "  Tamaño final: $finalSize GB" -ForegroundColor Gray
+                    
+                    if ($savings -gt 0) {
+                        Write-Host "  Espacio ahorrado: $([math]::Round($savings, 2)) GB" -ForegroundColor Green
+                    }
+                    
+                    Write-Log "  Imagen optimizada: $originalSize GB → $finalSize GB ($elapsedTotal minutos)"
+                    
+                    # Reemplazar original
+                    Write-Host "  Reemplazando archivo original..." -ForegroundColor Gray
+                    Remove-Item $installFile -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                    Move-Item $tempWim $installFile -Force
+                    Write-Log "  ✓ Imagen optimizada con DISM y reemplazada"
+                }
+            } else {
+                Write-Host "ERROR: DISM falló con código $($process.ExitCode)" -ForegroundColor Red
+                Write-Host "Revisa el log: $dismLog" -ForegroundColor Yellow
+                Write-Log "ERROR DISM (código $($process.ExitCode)) - Ver log: $dismLog" -Level "ERROR"
+            }
+        }
+        
+        # Crear ISO con oscdimg
+        Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host "          CREANDO ISO BOOTEABLE" -ForegroundColor Cyan
+        Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+        
+        Write-Host "`nGenerando ISO: $isoName" -ForegroundColor Yellow
+        Write-Host "Este paso puede tardar 5-15 minutos..." -ForegroundColor Gray
+        Write-Host "Dependiendo del tamaño de la imagen y velocidad del disco" -ForegroundColor Gray
+        
+        # Preparar argumentos para oscdimg
+        $oscArgs = @()
+        
+        # Si tenemos etfsboot.com, usarlo
+        if (Test-Path $etfsboot) {
+            $oscArgs += "-bootdata:2#p0,e,b`"$etfsboot`""
+        }
+        
+        # Si tenemos efisys.bin, usarlo
+        if (Test-Path $efiBoot) {
+            if ($oscArgs.Count -gt 0) {
+                $oscArgs[-1] = $oscArgs[-1] + "#pEF,e,b`"$efiBoot`""
+            } else {
+                $oscArgs += "-bootdata:2#pEF,e,b`"$efiBoot`""
+            }
+        }
+        
+        # Si no tenemos archivos de boot, usar modo simple
+        if ($oscArgs.Count -eq 0) {
+            Write-Log "ADVERTENCIA: No se encontraron archivos de boot, creando ISO no-booteable" -Level "WARNING"
+            $oscArgs += "-n"
+        }
+        
+        # Agregar otros parámetros
+        $oscArgs += @(
+            "-m", "-o", "-u2", "-udfver102",
+            "-l`"Windows11_$cleanName`"",
+            "`"$WindowsDir`"",
+            "`"$isoPath`""
+        )
+        
+        Write-Log "  Ejecutando oscdimg..."
+        
+        # Mostrar progreso
+        Write-Progress -Activity "Creando ISO" -Status "Ejecutando oscdimg..." -PercentComplete 50
+        
+        # Crear archivo de log para oscdimg
+        $oscLog = "$LogsDir\oscdimg_$(Get-Date -Format 'HHmmss').log"
+        
+        # Ejecutar oscdimg y capturar salida
+        $oscProcess = Start-Process -FilePath $OscdimgExe `
+            -ArgumentList ($oscArgs -join " ") `
+            -NoNewWindow `
+            -RedirectStandardOutput $oscLog `
+            -RedirectStandardError "$oscLog.error" `
+            -PassThru `
+            -Wait
+        
+        Write-Progress -Activity "Creando ISO" -Completed
+        
+        if ($oscProcess.ExitCode -eq 0) {
+            # Generar checksum
+            $checksum = Get-FileHash -Path $isoPath -Algorithm SHA256
+            $hashFile = "$isoPath.sha256"
+            $checksum.Hash | Out-File $hashFile
+            
+            $sizeGB = [math]::Round((Get-Item $isoPath).Length / 1GB, 2)
+            
+            Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Green
+            Write-Host "            ISO CREADA EXITOSAMENTE" -ForegroundColor Green
+            Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "📁 Archivo: $isoName" -ForegroundColor White
+            Write-Host "📍 Ubicación: C:\ISO_File\" -ForegroundColor Cyan
+            Write-Host "📊 Tamaño: $sizeGB GB" -ForegroundColor Gray
+            Write-Host "🔒 Checksum: $(Split-Path $hashFile -Leaf)" -ForegroundColor Gray
+            Write-Host ""
+            
+            Write-Log "✓ ISO creada: $isoPath ($sizeGB GB)"
+            return $isoPath
+        } else {
+            Write-Host "ERROR: oscdimg falló con código $($oscProcess.ExitCode)" -ForegroundColor Red
+            if (Test-Path "$oscLog.error") {
+                $errorContent = Get-Content "$oscLog.error" -Raw
+                Write-Host "Detalles: $errorContent" -ForegroundColor Yellow
+            }
+            Write-Log "ERROR oscdimg (código $($oscProcess.ExitCode))" -Level "ERROR"
+            return $null
+        }
+        
+    } catch {
+        Write-Host "ERROR creando ISO: ${_}" -ForegroundColor Red
+        Write-Log "ERROR creando ISO: ${_}" -Level "ERROR"
+        return $null
+    }
+}
+
+#---------[ FLUJO PRINCIPAL OPTIMIZADO ]---------
+try {
+    Show-Header
+    Write-Log "=== INICIANDO PERSONALIZACIÓN DE WINDOWS 11 ==="
+    Write-Log "Versión: DISM Optimizada (flujo de un solo paso)"
+    
+    # Paso 0: Limpieza de montajes previos
+    Cleanup-PreviousMounts
+    
+    # Paso 1: Verificar requisitos
+    Test-Requirements
+    
+    # Paso 2: Crear archivo autounattend.xml
+    $autounattendCreated = Create-Autounattend
+    if (-not $autounattendCreated) {
+        Write-Host "ADVERTENCIA: No se pudo crear autounattend.xml" -ForegroundColor Yellow
+        Write-Host "Continuando sin archivo de configuración automática..." -ForegroundColor Gray
+    }
+    
+    # Paso 3: Buscar archivo install automáticamente
+    $installFile = Find-InstallFile
+    
+    # Paso 4: Mostrar ediciones y seleccionar
+    $images = Get-ImageInfo -ImagePath $installFile.Path
+    $selectedEdition = Select-Edition -Images $images
+    
+    # Confirmación
+    Write-Host "`n══════════════════════════════════════════════════════════" -ForegroundColor Yellow
+    Write-Host "¿Deseas continuar con la personalización?" -ForegroundColor Yellow
+    Write-Host "Se realizarán estas acciones:" -ForegroundColor Gray
+    Write-Host "  1. Aplicar registros de personalización" -ForegroundColor Gray
+    Write-Host "  2. Eliminar aplicaciones preinstaladas" -ForegroundColor Gray
+    Write-Host "  3. Limpiar Menú Inicio (solo Edge y Configuración)" -ForegroundColor Gray
+    Write-Host "  4. Exportar solo la edición seleccionada (optimizado)" -ForegroundColor Green
+    Write-Host "  5. Procesar boot.wim (bypass requisitos)" -ForegroundColor Gray
+    if ($global:CanCreateISO) {
+        Write-Host "  6. Crear ISO booteable" -ForegroundColor Gray
+    } else {
+        Write-Host "  6. [SALTADO] Crear ISO (falta oscdimg.exe)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "NOTA: Flujo optimizado - un solo paso de exportación" -ForegroundColor Cyan
+    Write-Host ""
+    
+    while ($true) {
+        $confirm = Get-UserInput -Prompt "Continuar? (S/N)" -AllowCancel $true
+        
+        if ($confirm -match '^[SsYy]') {
+            break
+        } elseif ($confirm -match '^[Nn]') {
+            Write-Host "Operación cancelada por el usuario." -ForegroundColor Yellow
+            Cleanup-AllTemporary
+            Move-LogToFolder
+            exit
+        } else {
+            Write-Host "Por favor, ingresa S (Sí) o N (No)" -ForegroundColor Red
+        }
+    }
+    
+    # Paso 5: Procesar la edición seleccionada (FLUJO OPTIMIZADO)
+    # Esta función combina: montar, aplicar cambios, y exportar en un solo paso
+    $processResult = Mount-And-Process -ImagePath $installFile.Path -Index $selectedEdition.ImageIndex -EditionName $selectedEdition.ImageName
+    
+    if (-not $processResult) {
+        Write-Host "ERROR crítico al procesar la imagen" -ForegroundColor Red
+        Cleanup-AllTemporary
+        Move-LogToFolder
+        exit
+    }
+    
+    # Paso 6: Procesar boot.wim
+    $bootResult = Process-BootWim
+    
+    if (-not $bootResult) {
+        Write-Host "ADVERTENCIA: Problemas procesando boot.wim" -ForegroundColor Yellow
+        Write-Host "El bypass de requisitos puede no funcionar completamente" -ForegroundColor Yellow
+    }
+    
+    # Paso 7: Crear ISO
+    if ($global:CanCreateISO) {
+        Write-Host ""
+        $isoPath = Create-ISO -EditionName $selectedEdition.ImageName
+    } else {
+        Write-Host "`nINFO: No se creará ISO (falta oscdimg.exe)" -ForegroundColor Yellow
+        $isoPath = $null
+    }
+    
+    # Paso 8: Limpieza final
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "          LIMPIEZA FINAL" -ForegroundColor Cyan
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    
+    Cleanup-AllTemporary
+    Write-Host "✓ Archivos temporales eliminados" -ForegroundColor Green
+    
+    # Paso 9: Mover logs a carpeta LOGS
+    Move-LogToFolder
+    Write-Host "✓ Logs organizados en: C:\ISO_File\LOGS\" -ForegroundColor Green
+    
+    # Paso 10: Resumen final
+    $endTime = Get-Date
+    $duration = $endTime - $StartTime
+    
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "          PERSONALIZACIÓN COMPLETADA" -ForegroundColor Green
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "📊 RESUMEN (FLUJO OPTIMIZADO):" -ForegroundColor White
+    Write-Host "• Tiempo total: $([math]::Round($duration.TotalMinutes, 1)) minutos" -ForegroundColor Gray
+    Write-Host "• Edición: $($selectedEdition.ImageName)" -ForegroundColor Gray
+    Write-Host "• Flujo: Montar → Modificar → Exportar (1 paso)" -ForegroundColor Cyan
+    Write-Host "• Boot.wim procesado: $(if($bootResult){'✓'}else{'✗'})" -ForegroundColor $(if($bootResult){'Gray'}else{'Yellow'})
+    Write-Host "• autounattend.xml creado: $(if($autounattendCreated){'✓'}else{'✗'})" -ForegroundColor $(if($autounattendCreated){'Gray'}else{'Yellow'})
+    Write-Host "• Temporales limpiados: ✓" -ForegroundColor Gray
+    
+    if ($isoPath) {
+        Write-Host "• ISO creada: $(Split-Path $isoPath -Leaf)" -ForegroundColor Green
+        Write-Host "• Ubicación: C:\ISO_File\" -ForegroundColor Cyan
+    } else {
+        Write-Host "• ISO creada: ✗ (no se pudo crear)" -ForegroundColor Yellow
+    }
+    
+    Write-Host ""
+    Write-Host "📁 Log detallado: $LogFile" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Gray
+    
+    # Opción final para salir o ver log
+    Write-Host "Presiona:" -ForegroundColor Yellow
+    Write-Host "  1 - Ver log completo" -ForegroundColor Gray
+    Write-Host "  2 - Abrir carpeta de ISO" -ForegroundColor Gray
+    Write-Host "  0 o Q - Salir" -ForegroundColor Gray
+    Write-Host ""
+    
+    $choice = Get-UserInput -Prompt "Selecciona una opción" -Default "0" -AllowCancel $true
+    
+    switch ($choice) {
+        "1" {
+            # Mostrar log completo
+            Write-Host ""
+            Write-Host "LOG COMPLETO:" -ForegroundColor Cyan
+            Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Gray
+            if (Test-Path $LogFile) {
+                Get-Content $LogFile | ForEach-Object { Write-Host $_ }
+            }
+            Write-Host ""
+            Write-Host "Presiona cualquier tecla para salir..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "2" {
+            # Abrir carpeta de ISO
+            if ($isoPath -and (Test-Path $WorkingPath)) {
+                explorer $WorkingPath
+                Write-Host "Carpeta abierta: $WorkingPath" -ForegroundColor Green
+                Write-Host "Presiona cualquier tecla para salir..." -ForegroundColor Gray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            } else {
+                Write-Host "No se pudo abrir la carpeta." -ForegroundColor Red
+                Write-Host "Presiona cualquier tecla para salir..." -ForegroundColor Gray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+        }
+        default {
+            # Salir directamente
+            Write-Host "Saliendo..." -ForegroundColor Gray
+        }
+    }
+    
+} catch {
+    Write-Host "`n❌ ERROR CRÍTICO: ${_}" -ForegroundColor Red
+    Write-Log "ERROR CRÍTICO: ${_}" -Level "ERROR"
+    
+    # Limpiar antes de salir
+    try {
+        Cleanup-AllTemporary
+        Move-LogToFolder
+    } catch {
+        Write-Host "Error durante la limpieza de emergencia" -ForegroundColor Yellow
+    }
+    
+    Write-Host "`nRevisa el log: $LogFile" -ForegroundColor Yellow
+    Write-Host "Presiona cualquier tecla para salir..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
