@@ -1,9 +1,18 @@
+Actualización al 30 de diciembre del 2025.
+
 El siguiente Script es para optimizar y hacer debloat a Windows 11, NO ES FUNCIONAL AÚN, puesto que estaba en desarrollo,
 pero ya me harté porque agrego algo, deja de funcionar, quito algo, deja de funcionar, dejo como originalmente estaba (nivel muy básico)
 y si, funciona, vuelvo a empezar y agrego cosa por cosa, y vuelve a fallar, y aclaro que no soy experto en el tema de la programación o
 desarrollo de software, pero algo - algo comprendo, solo que ya se me sale del presupuesto mental jajajajajaja, les dejo el script hasta
 donde avancé por si alguien se interesa y quiere continuarlo, corregirlo y finalizarlo. La idea es que mientras menos toque en el sistema,
 mucho mejor para la estabilidad e integridad del mismo.
+
+El proyecto tiene un script y varias carpetas, en el siguiente enlace pueden descargar las carpetas, deben descomprimir su contenido y ubicar
+la carpeta "ISO_File" con su contenido en la raíz de la unidad C:\
+https://1drv.ms/u/c/ab3d85fd1f3319ac/IQA-TxELMsr-TYbBpncOHtsgAYTqeA4hr9r03mxVDQe3NVk?e=WyyFBa
+Actualmente el contenido del comprimido tiene un script básico con el cuál inicié todo y es funcional, pero le hacen falta varios detalles.
+
+A continuación dejo el Script más actualizado que hice y que pueden mejorarlo, es más completo y complejo que el del archivo comprimido arriba. 
 
 Script WiOS Project:
 
