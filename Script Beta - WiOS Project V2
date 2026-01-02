@@ -1,0 +1,605 @@
+
+Antes que nada, es necesario que revises e primer script creado para comprender el tema, Contiene
+archivos de descarga y todo lo necesario para estudiarlo.
+
+Link del primer beta en proceso y con fallas para que lo puedan estudiar, analizar y comparar: 
+https://github.com/LatinserverEc/WiOS-Project/blob/main/Script%20%22beta%22
+
+==================================
+NOTEVADES al 2 de enero del 2025:
+==================================
+
+===================================================================================
+Yosafat Antonio ha actualizdo el proyecto inicial "Script Beta" de "WiOS Project".
+Agradecimientos totales a Yosafat Antonio por esta corrección y actualización.
+===================================================================================
+
+=============================================================================================
+Link de descarga del proyecto actualizdo y corregido al 2 de enero del 2025
+https://1drv.ms/u/c/ab3d85fd1f3319ac/IQDULCBAFpIXT5toruk814n_AeI8ziPiY9UltA2iuHRym50?e=wVxweh
+=============================================================================================
+
+===============================================================
+Script Beta - WiOS project V2 - con todos los nuevos cambios:
+===============================================================
+
+<#
+.SYNOPSIS
+    WiOS BUILDER v0.2 - Generador de ISO Windows 11 Personalizada
+.DESCRIPTION
+    Este script automatiza la creación de una ISO de Windows 11 optimizada.
+    
+    CARACTERÍSTICAS TÉCNICAS:
+    1. Detección Inteligente: Encuentra install.wim recursivamente en la carpeta seleccionada.
+    2. Inyección de Drivers: Interfaz visual para comparar e inyectar drivers.
+    3. Eliminación de Bloatware: Método seguro usando objetos (Get-Appx) en lugar de texto.
+    4. Limpieza Menú Inicio: Borrado físico de .lnk y bloqueo de sugerencias por política.
+    5. Registro Masivo: Aplica tweaks de privacidad, rendimiento y UI (Clásico).
+    6. Boot.wim Deep Patch: Modifica System, Default y NTUser dentro del instalador para evitar advertencias de TPM/CPU.
+    7. Optimización: Exporta la imagen (Compresión Max) para reducir tamaño.
+    8. Seguridad: Gestión de Hives con Garbage Collector para evitar corrupción.
+#>
+
+# ==============================================================================
+# 1. AUTO-ELEVACIÓN Y CONFIGURACIÓN INICIAL
+# ==============================================================================
+
+# Verificar privilegios de Administrador
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    Start-Process PowerShell -Verb RunAs -ArgumentList $arguments
+    exit
+}
+
+# Cargar librerías gráficas necesarias para las GUIs
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Limpiar pantalla y mostrar cabecera
+Clear-Host
+Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "            WiOS BUILDER - v0.2" -ForegroundColor Cyan
+Write-Host "      Corrección Boot.wim + Privacidad + Drivers" -ForegroundColor Cyan
+Write-Host "══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ""
+
+# --- A. DEFINICIÓN DE RUTAS DE LA HERRAMIENTA ---
+# Detectar dónde está ejecutándose el script para crear las carpetas de trabajo relativas a él
+$ScriptDir = $PSScriptRoot
+if (-not $ScriptDir) { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ProjectRoot = Split-Path -Parent $ScriptDir
+
+# Definir carpetas de infraestructura
+$LogsDir    = Join-Path $ProjectRoot "Logs"
+$ToolsDir   = Join-Path $ProjectRoot "Tools" 
+# Fallback: si Tools no está en la raíz, buscar dentro de la carpeta del script
+if (-not (Test-Path $ToolsDir)) { $ToolsDir = Join-Path $ScriptDir "Tools" } 
+
+$MountDir   = Join-Path $ProjectRoot "WiOS/MOUNT"
+$TempDir    = Join-Path $ProjectRoot "WiOS/TEMP"
+$OscdimgExe = Join-Path $ToolsDir "oscdimg.exe"
+
+# Crear estructura de carpetas si no existen
+New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $MountDir -Force | Out-Null
+New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+
+$LogFile = Join-Path $LogsDir "WiOS_Build_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
+
+# --- B. SELECCIÓN DE FUENTE (ARCHIVOS DE WINDOWS) ---
+$fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+$fbd.Description = "SELECCIONA LA CARPETA DONDE EXTRAJISTE LA ISO DE WINDOWS 11"
+$fbd.ShowNewFolderButton = $false
+
+if ($fbd.ShowDialog() -ne 'OK') { 
+    Write-Warning "Operación cancelada por el usuario."
+    exit 
+}
+
+$SelectedPath = $fbd.SelectedPath
+Write-Host "Buscando install.wim en: $SelectedPath..." -ForegroundColor Yellow
+
+# Búsqueda recursiva inteligente del archivo de imagen
+$installFileItem = Get-ChildItem -Path $SelectedPath -Include "install.wim","install.esd" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+if (-not $installFileItem) {
+    [System.Windows.Forms.MessageBox]::Show("ERROR FATAL:`nNo se encontró 'install.wim' ni 'install.esd' en la carpeta seleccionada.`n`nAsegúrate de haber extraído la ISO correctamente.", "Archivo no encontrado", 'OK', 'Error')
+    exit
+}
+
+# Configuración de rutas basada en el hallazgo
+$SourcesDir  = $installFileItem.DirectoryName
+$WindowsDir  = Split-Path -Path $SourcesDir -Parent 
+$WorkingPath = $SelectedPath # La ISO se guardará en la raíz de la carpeta seleccionada
+
+Write-Host "✓ Fuente detectada: $($installFileItem.Name)" -ForegroundColor Green
+Write-Host "✓ Destino de ISO: $WorkingPath" -ForegroundColor Gray
+
+# ==============================================================================
+# 2. FUNCIONES CORE (UTILIDADES Y GESTIÓN)
+# ==============================================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "HH:mm:ss"
+    switch ($Level) {
+        "INFO"    { Write-Host "[$ts] $Message" -ForegroundColor Gray }
+        "ACTION"  { Write-Host "[$ts] $Message" -ForegroundColor Cyan }
+        "SUCCESS" { Write-Host "[$ts] $Message" -ForegroundColor Green }
+        "WARNING" { Write-Host "[$ts] $Message" -ForegroundColor Yellow }
+        "ERROR"   { Write-Host "[$ts] $Message" -ForegroundColor Red }
+    }
+    "[$ts] [$Level] $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
+}
+
+function Cleanup-MountPoints {
+    Write-Log "Verificando estado de montaje..." "INFO"
+    # 1. Intentar desmontar limpiamente con DISM
+    $mounted = Get-WindowsImage -Mounted 2>$null
+    if ($mounted) {
+        foreach ($img in $mounted) {
+            if ($img.MountPath -eq $MountDir) {
+                Write-Log "Desmontando imagen residual..." "WARNING"
+                Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    # 2. Limpieza forzada de archivos basura
+    if (Test-Path "$MountDir\*") { 
+        Remove-Item "$MountDir\*" -Recurse -Force -ErrorAction SilentlyContinue 
+    }
+}
+
+function Unmount-Hives-Safe {
+    # Función crítica para evitar corrupción del registro
+    # Fuerza la liberación de memoria antes de desmontar
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Start-Sleep -Seconds 2
+    
+    # Lista de todos los posibles hives montados por el script
+    $hives = @("HKLM\WiOS_Sys", "HKLM\WiOS_Soft", "HKLM\WiOS_User", "HKLM\WiOS_Def", "HKLM\WiOS_BootSys", "HKLM\WiOS_BootDef", "HKLM\WiOS_BootUser")
+    
+    foreach ($h in $hives) {
+        $retries = 0
+        while ($retries -lt 5) {
+            reg unload $h 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { break }
+            $retries++
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+# --- GUI DE DRIVERS ---
+function Show-Drivers-GUI {
+    param([string]$TargetMountDir)
+    
+    # Configuración del Formulario
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "WiOS Driver Injector - (Offline)"
+    $form.Size = New-Object System.Drawing.Size(1000, 650)
+    $form.StartPosition = "CenterScreen"
+    $form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $form.ForeColor = [System.Drawing.Color]::White
+    $form.TopMost = $true
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = "Inyección de Drivers (Opcional)"
+    $lblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.Location = New-Object System.Drawing.Point(20, 15)
+    $lblTitle.AutoSize = $true
+    $form.Controls.Add($lblTitle)
+
+    # Botones
+    $btnLoad = New-Object System.Windows.Forms.Button
+    $btnLoad.Text = "[CARPETA] Cargar..."
+    $btnLoad.Location = New-Object System.Drawing.Point(600, 12); $btnLoad.Size = New-Object System.Drawing.Size(160, 30)
+    $btnLoad.FlatStyle = "Flat"; $btnLoad.BackColor = [System.Drawing.Color]::Gray; $form.Controls.Add($btnLoad)
+
+    $btnAdd = New-Object System.Windows.Forms.Button
+    $btnAdd.Text = "+ Archivo .INF"
+    $btnAdd.Location = New-Object System.Drawing.Point(770, 12); $btnAdd.Size = New-Object System.Drawing.Size(180, 30)
+    $btnAdd.FlatStyle = "Flat"; $btnAdd.BackColor = [System.Drawing.Color]::RoyalBlue; $form.Controls.Add($btnAdd)
+
+    # Lista
+    $listView = New-Object System.Windows.Forms.ListView
+    $listView.Location = New-Object System.Drawing.Point(20, 60); $listView.Size = New-Object System.Drawing.Size(940, 480)
+    $listView.View = "Details"; $listView.CheckBoxes = $true; $listView.FullRowSelect = $true; $listView.GridLines = $true
+    $listView.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 48); $listView.ForeColor = [System.Drawing.Color]::White
+    
+    $listView.Columns.Add("Estado", 100) | Out-Null
+    $listView.Columns.Add("Archivo INF", 180) | Out-Null
+    $listView.Columns.Add("Clase", 100) | Out-Null
+    $listView.Columns.Add("Version", 120) | Out-Null
+    $listView.Columns.Add("Ruta Completa", 400) | Out-Null
+    $form.Controls.Add($listView)
+
+    $btnInst = New-Object System.Windows.Forms.Button
+    $btnInst.Text = "INYECTAR Y CONTINUAR"
+    $btnInst.Location = New-Object System.Drawing.Point(760, 550); $btnInst.Size = New-Object System.Drawing.Size(200, 40)
+    $btnInst.FlatStyle = "Flat"; $btnInst.BackColor = [System.Drawing.Color]::SeaGreen; $form.Controls.Add($btnInst)
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Text = "Esperando..."
+    $lblStatus.Location = New-Object System.Drawing.Point(20, 560); $lblStatus.AutoSize = $true; $lblStatus.ForeColor = [System.Drawing.Color]::Cyan
+    $form.Controls.Add($lblStatus)
+
+    # Variables Locales
+    $installedDrivers = @()
+
+    # Helper para procesar INFs (Lectura robusta de versión)
+    $ProcessInf = { 
+        param($f) 
+        $c="Desconocido"; $v="---"; $s="Nuevo"; $inst=$false
+        try { 
+            $content = Get-Content $f.FullName -TotalCount 300 -ErrorAction SilentlyContinue 
+            foreach($l in $content){ 
+                if($l -match "^Class\s*=\s*(.*)"){$c=$matches[1].Trim()}
+                if($l -match "DriverVer\s*=\s*.*?,([0-9\.\s]+)"){$v=$matches[1].Trim()}
+                if($c -ne "Desconocido" -and $v -ne "---"){break}
+            }
+        } catch {}
+
+        # Comparación
+        $matchName = $installedDrivers | Where { [IO.Path]::GetFileName($_.OriginalFileName) -eq $f.Name }
+        if($matchName){ $inst=$true; $s="INSTALADO (Nombre)" }
+        elseif($v -ne "---"){ 
+            $matchVer = $installedDrivers | Where { $_.Version -eq $v -and $_.ClassName -eq $c }
+            if($matchVer){ $inst=$true; $s="INSTALADO (Ver)" } 
+        }
+
+        $i=New-Object System.Windows.Forms.ListViewItem($s)
+        $i.SubItems.Add($f.Name)|Out-Null; $i.SubItems.Add($c)|Out-Null; $i.SubItems.Add($v)|Out-Null; $i.SubItems.Add($f.FullName)|Out-Null
+        $i.Tag=$f.FullName
+        if($inst){$i.ForeColor=[Drawing.Color]::Gold; $i.Checked=$false} else {$i.Checked=$true}
+        return $i
+    }
+
+    # Eventos
+    $form.Add_Shown({ 
+        $form.Refresh(); $listView.BeginUpdate()
+        $lblStatus.Text = "Leyendo drivers de la imagen..."
+        try{ $installedDrivers = Get-WindowsDriver -Path $TargetMountDir -ErrorAction SilentlyContinue }catch{}
+        $listView.EndUpdate(); $lblStatus.Text = "Listo. Añade drivers o continúa."
+    })
+
+    $btnLoad.Add_Click({ 
+        $fb=New-Object System.Windows.Forms.FolderBrowserDialog
+        if($fb.ShowDialog()-eq'OK'){ 
+            $listView.BeginUpdate()
+            Get-ChildItem $fb.SelectedPath -Filter "*.inf" -Recurse | ForEach { $listView.Items.Add((& $ProcessInf $_)) }
+            $listView.EndUpdate() 
+        } 
+    })
+
+    $btnAdd.Add_Click({ 
+        $op=New-Object System.Windows.Forms.OpenFileDialog; $op.Filter="INF|*.inf"; $op.Multiselect=$true
+        if($op.ShowDialog()-eq'OK'){ 
+            $listView.BeginUpdate()
+            foreach($n in $op.FileNames){ $listView.Items.Add((& $ProcessInf (Get-Item $n))) }
+            $listView.EndUpdate() 
+        } 
+    })
+
+    $btnInst.Add_Click({ 
+        $sel=$listView.CheckedItems
+        if($sel.Count -eq 0){ $form.Close(); return }
+        $form.Cursor=[System.Windows.Forms.Cursors]::WaitCursor; $btnInst.Enabled=$false
+        foreach($it in $sel){ 
+            $lblStatus.Text = "Inyectando: $($it.SubItems[1].Text)"; $form.Refresh()
+            dism /Image:$TargetMountDir /Add-Driver /Driver:"$($it.Tag)" /ForceUnsigned | Out-Null
+            if($LASTEXITCODE -eq 0){ $it.ForeColor=[Drawing.Color]::LightGreen; $it.Text="OK"; $it.Checked=$false }
+            else { $it.ForeColor=[Drawing.Color]::Red; $it.Text="ERROR" }
+        }
+        $form.Cursor=[System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.MessageBox]::Show("Inyección finalizada.", "WiOS", 'OK', 'Information')
+        $form.Close()
+    })
+
+    $form.ShowDialog() | Out-Null
+    $form.Dispose()
+}
+
+# ==============================================================================
+# 3. LÓGICA DE NEGOCIO (REGLAS Y MODIFICACIONES)
+# ==============================================================================
+
+function Create-Autounattend {
+    Write-Log "Generando autounattend.xml (Bypass OOBE)..." "ACTION"
+    $xmlPath = Join-Path $WindowsDir "autounattend.xml"
+    
+    # XML Mínimo para saltar cuenta Microsoft y EULA
+    $xmlContent = @"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <UserData><AcceptEula>true</AcceptEula></UserData>
+        </component>
+    </settings>
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <OOBE>
+                <ProtectYourPC>3</ProtectYourPC>
+                <HideEULAPage>true</HideEULAPage>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+            </OOBE>
+        </component>
+    </settings>
+</unattend>
+"@
+    $xmlContent | Out-File -FilePath $xmlPath -Encoding UTF8 -Force
+    Write-Log "Archivo autounattend.xml creado correctamente." "SUCCESS"
+}
+
+function Clean-StartMenu-Full {
+    Write-Log "Limpiando Menú Inicio (Archivos y Layout)..." "ACTION"
+    
+    # 1. Limpieza Física: Elimina accesos directos basura predeterminados
+    $pathsToClean = @(
+        "$MountDir\ProgramData\Microsoft\Windows\Start Menu\Programs",
+        "$MountDir\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"
+    )
+    $keep = @("System Tools", "Accessories", "Administrative Tools", "Windows PowerShell", "File Explorer")
+    
+    foreach ($path in $pathsToClean) {
+        if (Test-Path $path) {
+            Get-ChildItem -Path $path -Recurse | Where-Object { 
+                $name = $_.Name
+                $shouldKeep = $false
+                foreach ($k in $keep) { if ($name -match $k) { $shouldKeep = $true } }
+                if (-not $shouldKeep) { return $true } else { return $false }
+            } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # 2. Restaurar Edge: Si se borró, lo recreamos
+    $edgeLnk = "$MountDir\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.url"
+    $edgeContent = "[InternetShortcut]`r`nURL=https://www.microsoft.com/edge`r`nIconIndex=0`r`nIconFile=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+    $edgeContent | Out-File -FilePath $edgeLnk -Encoding ASCII -Force
+    
+    # 3. Layout XML Vacío: Para evitar que Windows recree tiles de publicidad
+    $layoutXml = @"
+<LayoutModificationTemplate xmlns='http://schemas.microsoft.com/Start/2014/LayoutModification' Version='1'>
+  <LayoutOptions StartTileGroupCellWidth='6'/>
+  <DefaultLayoutOverride>
+    <StartLayoutCollection>
+      <defaultlayout:StartLayout xmlns:defaultlayout='http://schemas.microsoft.com/Start/2014/FullDefaultLayout'>
+        <start:Group Name='' xmlns:start='http://schemas.microsoft.com/Start/2014/StartLayout'/>
+      </defaultlayout:StartLayout>
+    </StartLayoutCollection>
+  </DefaultLayoutOverride>
+</LayoutModificationTemplate>
+"@
+    $layoutPath = "$MountDir\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml"
+    New-Item -ItemType Directory -Path (Split-Path $layoutPath) -Force -ErrorAction SilentlyContinue | Out-Null
+    $layoutXml | Out-File -FilePath $layoutPath -Encoding UTF8 -Force
+    
+    Write-Log "Menú Inicio limpiado y bloqueado." "SUCCESS"
+}
+
+function Remove-Bloatware-Safe {
+    Write-Log "Eliminando Bloatware (Lista Segura)..." "ACTION"
+    # Lista de patrones para eliminar (Seguro para el sistema)
+    $patterns = @(
+        "*BingNews*", "*BingWeather*", "*BingSearch*", "*GetHelp*", "*Getstarted*", 
+        "*Solitaire*", "*StickyNotes*", "*OfficeHub*", "*OneNote*", "*PowerAutomate*", 
+        "*Clipchamp*", "*DevHome*", "*QuickAssist*", "*SkypeApp*", "*Teams*", "*People*", 
+        "*Todos*", "*WindowsCommunicationsApps*", "*FeedbackHub*", "*WindowsAlarms*", 
+        "*WindowsMaps*", "*Wallet*", "*MixedReality*", "*ScreenSketch*"
+    )
+    
+    $apps = Get-AppxProvisionedPackage -Path $MountDir
+    foreach ($app in $apps) {
+        foreach ($pat in $patterns) {
+            if ($app.DisplayName -like $pat) {
+                Write-Host "  [-] Borrando: $($app.DisplayName)... " -NoNewline
+                try {
+                    Remove-AppxProvisionedPackage -Path $MountDir -PackageName $app.PackageName -ErrorAction Stop | Out-Null
+                    Write-Host "OK" -ForegroundColor Green
+                } catch {
+                    Write-Host "ERROR" -ForegroundColor Red
+                }
+                break
+            }
+        }
+    }
+}
+
+function Apply-Registry-Full {
+    Write-Log "Aplicando Registro Masivo..." "ACTION"
+    $sys = "$MountDir\Windows\System32\config\SYSTEM"
+    $soft = "$MountDir\Windows\System32\config\SOFTWARE"
+    $def = "$MountDir\Windows\System32\config\DEFAULT"
+    $user = "$MountDir\Users\Default\NTUSER.DAT"
+
+    try {
+        reg load HKLM\WiOS_Sys $sys 2>$null | Out-Null
+        reg load HKLM\WiOS_Soft $soft 2>$null | Out-Null
+        reg load HKLM\WiOS_Def $def 2>$null | Out-Null
+        reg load HKLM\WiOS_User $user 2>$null | Out-Null
+
+        # 1. SETUP / LABCONFIG (Bypass Requisitos)
+        $p = "HKLM\WiOS_Sys\Setup\LabConfig"
+        reg add $p /v BypassTPMCheck /t REG_DWORD /d 1 /f | Out-Null
+        reg add $p /v BypassSecureBootCheck /t REG_DWORD /d 1 /f | Out-Null
+        reg add $p /v BypassRAMCheck /t REG_DWORD /d 1 /f | Out-Null
+        reg add $p /v BypassStorageCheck /t REG_DWORD /d 1 /f | Out-Null
+        reg add $p /v BypassCPUCheck /t REG_DWORD /d 1 /f | Out-Null
+        reg add "HKLM\WiOS_Sys\Setup\MoSetup" /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 1 /f | Out-Null
+
+        # 2. PRIVACIDAD & TELEMETRÍA
+        reg add "HKLM\WiOS_Soft\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f | Out-Null
+        reg add "HKLM\WiOS_Soft\Microsoft\OEM\Device\Capture" /v NoPhysicalCameraLED /t REG_DWORD /d 1 /f | Out-Null
+        reg add "HKLM\WiOS_Soft\Policies\Microsoft\Windows Defender\Scan" /v AvgCPULoadFactor /t REG_DWORD /d 25 /f | Out-Null
+
+        # 3. OOBE (Saltar cuenta internet)
+        reg add "HKLM\WiOS_Soft\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f | Out-Null
+
+        # 4. POLÍTICAS DE UI (Menú Clásico y Limpio)
+        $pol = "HKLM\WiOS_Soft\Policies\Microsoft\Windows\Explorer"
+        reg add $pol /v HideRecentlyAddedApps /t REG_DWORD /d 1 /f | Out-Null
+        reg add $pol /v HideStartMenuSuggestions /t REG_DWORD /d 1 /f | Out-Null
+        reg add $pol /v Start_ShowClassicMode /t REG_DWORD /d 0 /f | Out-Null
+        reg add $pol /v LockedStartLayout /t REG_DWORD /d 1 /f | Out-Null
+        
+        # 5. BLOQUEO CONSUMER FEATURES (Candy Crush)
+        reg add "HKLM\WiOS_Soft\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f | Out-Null
+        reg add "HKLM\WiOS_Soft\Policies\Microsoft\Windows\CloudContent" /v DisableThirdPartySuggestions /t REG_DWORD /d 1 /f | Out-Null
+
+        # 6. USUARIO DEFAULT (Limpieza Visual)
+        $adv = "HKLM\WiOS_Def\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+        reg add $adv /v Start_TrackProgs /t REG_DWORD /d 0 /f | Out-Null
+        reg add $adv /v StartMenuInit /t REG_DWORD /d 4 /f | Out-Null
+        reg add "HKLM\WiOS_User\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d "0" /f | Out-Null
+
+        # 7. DRIVERS (No Windows Update)
+        reg add "HKLM\WiOS_Soft\Policies\Microsoft\Windows\DriverSearching" /v DontSearchWindowsUpdate /t REG_DWORD /d 1 /f | Out-Null
+
+        Write-Log "Registro aplicado correctamente." "SUCCESS"
+    } finally {
+        Unmount-Hives-Safe
+    }
+}
+
+# --- FUNCIÓN CRÍTICA DEL BETA: BOOT.WIM DEEP PATCH ---
+# Esta función carga los hives DENTRO del boot.wim para evitar el aviso "Este PC no cumple..."
+function Process-BootWim-Deep {
+    $boot = "$SourcesDir\boot.wim"
+    if (-not (Test-Path $boot)) { return }
+    Write-Log "Parcheando BOOT.WIM (Bypass Profundo)..." "ACTION"
+    
+    foreach ($i in 1..2) {
+        Write-Host "  >> Procesando Índice $i..." -ForegroundColor Cyan
+        try {
+            Mount-WindowsImage -ImagePath $boot -Index $i -Path $MountDir -ErrorAction Stop | Out-Null
+            
+            # Cargar TODOS los hives necesarios (Igual que el Script Beta)
+            reg load HKLM\WiOS_BootSys "$MountDir\Windows\System32\config\SYSTEM" 2>$null | Out-Null
+            reg load HKLM\WiOS_BootDef "$MountDir\Windows\System32\config\DEFAULT" 2>$null | Out-Null 
+            reg load HKLM\WiOS_BootUser "$MountDir\Users\Default\NTUSER.DAT" 2>$null | Out-Null
+
+            # 1. Bypass Estándar en SYSTEM
+            $lab = "HKLM\WiOS_BootSys\Setup\LabConfig"
+            reg add $lab /v BypassTPMCheck /t REG_DWORD /d 1 /f | Out-Null
+            reg add $lab /v BypassSecureBootCheck /t REG_DWORD /d 1 /f | Out-Null
+            reg add $lab /v BypassRAMCheck /t REG_DWORD /d 1 /f | Out-Null
+            reg add $lab /v BypassCPUCheck /t REG_DWORD /d 1 /f | Out-Null
+
+            # 2. Bypass de Advertencias Visuales (DEFAULT + NTUSER) - Clave del Beta
+            $keys = @("HKLM\WiOS_BootDef", "HKLM\WiOS_BootUser")
+            foreach ($k in $keys) {
+                reg add "$k\Control Panel\UnsupportedHardwareNotificationCache" /v SV1 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+                reg add "$k\Control Panel\UnsupportedHardwareNotificationCache" /v SV2 /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+            }
+
+            Unmount-Hives-Safe 
+            Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
+        } catch { 
+            Write-Log "Error procesando boot.wim índice $i. Desmontando..." "WARNING"
+            Dismount-WindowsImage -Path $MountDir -Discard 2>$null 
+        }
+    }
+    Write-Log "Boot.wim parcheado correctamente." "SUCCESS"
+}
+
+# ==============================================================================
+# 4. FLUJO PRINCIPAL DE EJECUCIÓN
+# ==============================================================================
+
+# A. Detectar Imagen
+$installImg = if (Test-Path "$SourcesDir\install.wim") { "$SourcesDir\install.wim" } else { "$SourcesDir\install.esd" }
+$imgInfo = Get-WindowsImage -ImagePath $installImg
+
+# B. Selección de Edición
+Write-Host "`nEdiciones detectadas:" -ForegroundColor Yellow
+$imgInfo | Format-Table ImageIndex, ImageName, Size -AutoSize
+$idx = Read-Host "Ingresa el NÚMERO DE ÍNDICE a modificar (Ej: 6)"
+
+if (-not $idx) { exit }
+
+try {
+    # PASO 1: MONTAR
+    Cleanup-MountPoints
+    Write-Log "Montando índice $idx de $installImg..." "ACTION"
+    Mount-WindowsImage -ImagePath $installImg -Index $idx -Path $MountDir -ErrorAction Stop | Out-Null
+    Write-Log "Imagen montada exitosamente." "SUCCESS"
+
+    # PASO 2: DRIVERS (Opcional)
+    $ud = [System.Windows.Forms.MessageBox]::Show("¿Deseas integrar controladores (Drivers) en esta imagen?`n`nSi = Abrir Inyector`nNo = Saltar paso", "Paso Opcional: Drivers", 'YesNo', 'Question')
+    if ($ud -eq 'Yes') { 
+        Write-Log "Abriendo Gestor de Drivers..." "ACTION"
+        Show-Drivers-GUI -TargetMountDir $MountDir
+        Write-Log "Gestión de drivers finalizada." "SUCCESS"
+    } else {
+        Write-Log "Drivers omitidos." "INFO"
+    }
+
+    # PASO 3: BLOATWARE
+    Remove-Bloatware-Safe
+
+    # PASO 4: LIMPIEZA INICIO
+    Clean-StartMenu-Full
+
+    # PASO 5: REGISTRO Y AUTOUNATTEND
+    Apply-Registry-Full
+    Create-Autounattend
+
+    # PASO 6: EXPORTAR Y OPTIMIZAR
+    Write-Log "Guardando cambios y optimizando..." "ACTION"
+    Dismount-WindowsImage -Path $MountDir -Save -ErrorAction Stop | Out-Null
+    
+    Write-Log "Recomprimiendo imagen (Exportación)..." "ACTION"
+    $newWim = Join-Path $TempDir "install.wim"
+    
+    # Usar DISM para exportar (Limpia componentes borrados y reduce tamaño)
+    $proc = Start-Process -FilePath "dism.exe" -ArgumentList "/Export-Image /SourceImageFile:`"$installImg`" /SourceIndex:$idx /DestinationImageFile:`"$newWim`" /Compress:max" -PassThru -Wait -NoNewWindow
+    
+    if ($proc.ExitCode -eq 0) {
+        Write-Log "Reemplazando archivo original..." "SUCCESS"
+        Remove-Item $installImg -Force
+        Move-Item $newWim "$SourcesDir\install.wim" -Force
+    } else {
+        Write-Log "Fallo en la exportación. Se mantiene la imagen modificada original." "WARNING"
+    }
+
+    # PASO 7: PROCESAR BOOT.WIM (Deep Patch)
+    Process-BootWim-Deep
+
+    # PASO 8: CREAR ISO
+    if (Test-Path $OscdimgExe) {
+        Write-Log "Generando ISO Booteable..." "ACTION"
+        $isoName = Join-Path $WorkingPath "Windows11_Mod_$(Get-Date -Format 'HHmm').iso"
+        
+        # Comandos de boot para UEFI y BIOS
+        $bootData = "-bootdata:2#p0,e,b`"$WindowsDir\boot\etfsboot.com`"#pEF,e,b`"$WindowsDir\efi\microsoft\boot\efisys.bin`""
+        $argsIso = "$bootData -u2 -udfver102 -m -lWiOS_Mod `"$WindowsDir`" `"$isoName`""
+        
+        $isoProc = Start-Process $OscdimgExe -ArgumentList $argsIso -Wait -NoNewWindow -PassThru
+        
+        if ($isoProc.ExitCode -eq 0) {
+            Write-Log "ISO Creada Exitosamente: $isoName" "SUCCESS"
+            [System.Windows.Forms.MessageBox]::Show("Proceso Completado Exitosamente.`n`nISO guardada en:`n$isoName", "WiOS Builder", 'OK', 'Information')
+        } else {
+            Write-Log "FALLO al crear ISO. Código: $($isoProc.ExitCode)" "ERROR"
+            [System.Windows.Forms.MessageBox]::Show("Error al crear ISO. Código: $($isoProc.ExitCode)", "Error", 'OK', 'Error')
+        }
+    } else {
+        Write-Log "No se encontró oscdimg.exe. No se creó la ISO." "WARNING"
+        [System.Windows.Forms.MessageBox]::Show("Proceso terminado (Sin ISO).`nNo se encontró oscdimg.exe en TOOLS.", "Aviso", 'OK', 'Warning')
+    }
+
+} catch {
+    Write-Log "ERROR CRÍTICO: $_" "ERROR"
+    [System.Windows.Forms.MessageBox]::Show("Ocurrió un error fatal:`n$_", "Error Crítico", 'OK', 'Error')
+} finally {
+    # Limpieza final de emergencia
+    if (Test-Path "$MountDir\Windows") {
+        Write-Log "Ejecutando limpieza de emergencia..." "WARNING"
+        Dismount-WindowsImage -Path $MountDir -Discard -ErrorAction SilentlyContinue
+    }
+}
