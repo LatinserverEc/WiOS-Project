@@ -14,7 +14,8 @@ Actualmente el contenido del comprimido tiene un script básico con el cuál ini
 
 A continuación dejo el Script más actualizado que hice y que pueden mejorarlo, es más completo y complejo que el del archivo comprimido arriba. 
 
-Script WiOS Project:
+Script WiOS Project, ya saben que este tipo de scripts se manejan en powershell, por tanto, se debe cuardar el archivo como "nombrecualquier.ps1",
+de todas maneras si descargas todo del link arriba, ya tienes todo listo solo para modificar a tu gusto y jugar un rato:
 
 <#
 .SYNOPSIS
